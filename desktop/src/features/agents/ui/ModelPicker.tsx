@@ -108,26 +108,38 @@ export function ModelPicker({
   }, [configSurface]);
 
   // Send a live `switch_model` frame to each channel the agent is working in
-  // and wait for the harness to acknowledge. Any single `unsupported_model`
-  // result rejects the whole pick immediately; all other statuses must arrive
-  // from every channel before resolving success.
+  // and wait for the harness to acknowledge. A single `unsupported_model`
+  // (model unavailable) or `failure` (adapter refused) result rejects the whole
+  // pick immediately. The busy-path `sent` ack is provisional (the adapter
+  // isn't consulted until the requeued session), so a later terminal frame can
+  // still reject; the remaining success statuses must arrive from every channel,
+  // else the timeout fallback confirms.
   const sendLiveSwitch = React.useCallback(
     (modelId: string) => {
       const channelIds = activeTurns.map((turn) => turn.channelId);
+      // Opaque per-pick correlator. The harness echoes it on the immediate ack
+      // and the late terminal frame, so a five-minute reconnect replay of an
+      // earlier pick's result cannot settle this one.
+      const requestId = crypto.randomUUID();
       return awaitLiveSwitchOutcome({
-        channelCount: channelIds.length,
-        modelId,
+        requestId,
+        channelIds,
         subscribe: (listener) =>
           subscribeControlResults(agent.pubkey, listener),
         sendSwitches: async () => {
           await Promise.all(
             channelIds.map((channelId) =>
-              switchManagedAgentModel(agent.pubkey, channelId, modelId),
+              switchManagedAgentModel(
+                agent.pubkey,
+                channelId,
+                modelId,
+                requestId,
+              ),
             ),
           );
         },
-        // No reply in time: treat as sent. The override still rides the
-        // requeued/next session; we just can't confirm synchronously.
+        // No terminal frame in time: treat as success. The override still
+        // rides the requeued/next session; we just can't confirm synchronously.
         scheduleTimeout: (onTimeout) => {
           const timeout = window.setTimeout(onTimeout, 8_000);
           return () => window.clearTimeout(timeout);
@@ -145,6 +157,12 @@ export function ModelPicker({
         const outcome = await sendLiveSwitch(modelId);
         if (outcome === "unsupported") {
           toast.error("That model isn't available for this agent.");
+          return;
+        }
+        if (outcome === "failed") {
+          toast.error(
+            "Couldn't switch models — the agent kept its current model.",
+          );
           return;
         }
         toast.success("Model switched for this session.");

@@ -3,10 +3,18 @@ import test from "node:test";
 
 import { awaitLiveSwitchOutcome } from "./liveSwitchOutcome.ts";
 
-const MODEL = "goose-claude-fable-5";
+const REQUEST_ID = "req-abc";
+const CH_A = "channel-a";
+const CH_B = "channel-b";
 
 function frame(status, overrides = {}) {
-  return { type: "switch_model", status, modelId: MODEL, ...overrides };
+  return {
+    type: "switch_model",
+    status,
+    requestId: REQUEST_ID,
+    channelId: CH_A,
+    ...overrides,
+  };
 }
 
 /**
@@ -15,7 +23,7 @@ function frame(status, overrides = {}) {
  * no-ops, matching `observerRelayStore`), a manual timeout, and a deferred
  * `sendSwitches` the test resolves explicitly.
  */
-function harness(channelCount) {
+function harness(channelIds, requestId = REQUEST_ID) {
   let listener = null;
   let timeoutCb = null;
   let unsubscribeCalls = 0;
@@ -26,8 +34,8 @@ function harness(channelCount) {
   });
 
   const outcome = awaitLiveSwitchOutcome({
-    channelCount,
-    modelId: MODEL,
+    requestId,
+    channelIds,
     subscribe: (fn) => {
       listener = fn;
       return () => {
@@ -61,47 +69,39 @@ function harness(channelCount) {
   };
 }
 
+const drainMicrotasks = async () => {
+  for (let i = 0; i < 5; i++) {
+    await Promise.resolve();
+  }
+};
+
 test("awaitLiveSwitchOutcome fast sent on one channel does not mask a later unsupported on another", async () => {
-  const h = harness(2);
+  const h = harness([CH_A, CH_B]);
   // Channel A acks fast as `sent`; a first-ack-resolves impl would settle "ok"
   // here. The fail-fast contract must keep waiting and then reject on B.
   h.push(frame("sent"));
-  h.push(frame("unsupported_model"));
+  h.push(frame("unsupported_model", { channelId: CH_B }));
   assert.equal(await h.outcome, "unsupported");
 });
 
-test("awaitLiveSwitchOutcome resolves ok only after the last channel acks", async () => {
-  const h = harness(3);
+test("awaitLiveSwitchOutcome resolves ok only after every distinct channel acks", async () => {
+  const h = harness([CH_A, CH_B]);
   let settled = false;
   void h.outcome.then(() => {
     settled = true;
   });
 
-  // The `.then` that flips `settled` flushes on a later microtask tick than a
-  // single drain, so a single `await Promise.resolve()` would let this
-  // assertion pass even against a first-ack-resolves bug. Draining several
-  // ticks guarantees a resolved promise's callback has run, so the interim
-  // `settled === false` checks deterministically regress an early resolve.
-  const drainMicrotasks = async () => {
-    for (let i = 0; i < 5; i++) {
-      await Promise.resolve();
-    }
-  };
-
-  h.push(frame("sent"));
+  // Terminal success for channel A alone must not settle a two-channel pick.
+  h.push(frame("switched", { channelId: CH_A }));
   await drainMicrotasks();
-  assert.equal(settled, false, "must not resolve on the first ack");
+  assert.equal(settled, false, "must not resolve before every channel acks");
 
-  h.push(frame("switched"));
-  await drainMicrotasks();
-  assert.equal(settled, false, "must not resolve before the last ack");
-
-  h.push(frame("turn_ending"));
+  h.push(frame("turn_ending", { channelId: CH_B }));
   assert.equal(await h.outcome, "ok");
 });
 
 test("awaitLiveSwitchOutcome rejects on unsupported immediately and unsubscribes exactly once", async () => {
-  const h = harness(2);
+  const h = harness([CH_A, CH_B]);
   h.push(frame("unsupported_model"));
   assert.equal(await h.outcome, "unsupported");
   assert.equal(h.unsubscribeCalls, 1);
@@ -113,15 +113,84 @@ test("awaitLiveSwitchOutcome rejects on unsupported immediately and unsubscribes
   assert.equal(h.unsubscribeCalls, 1, "no double-unsubscribe on a late frame");
 });
 
-test("awaitLiveSwitchOutcome ignores frames for a different model or control type", async () => {
-  const h = harness(1);
-  h.push(frame("sent", { modelId: "some-other-model" }));
-  h.push({ type: "cancel_turn", status: "sent", modelId: MODEL });
+test("awaitLiveSwitchOutcome settles failed immediately on an adapter-refused frame without waiting for other channels or the timeout", async () => {
+  const h = harness([CH_A, CH_B, "channel-c"]);
+  // Three channels, so a success-path impl would need three acks. A single
+  // `failure` frame must fail-fast to "failed" (not "unsupported", not "ok")
+  // before the other two channels reply — proving it never traverses the
+  // success-count path.
+  h.push(frame("failure"));
+  assert.equal(await h.outcome, "failed");
+  // The timeout was cancelled (no 8s wait) and the listener detached exactly
+  // once — the frame settled synchronously, not via the fallback.
+  assert.equal(h.cancelTimeoutCalls, 1, "timeout cancelled, not awaited");
+  assert.equal(h.unsubscribeCalls, 1);
+
+  // A later frame must not re-resolve or re-unsubscribe.
+  h.push(frame("switched"));
+  assert.equal(h.unsubscribeCalls, 1, "no double-unsubscribe on a late frame");
+});
+
+test("awaitLiveSwitchOutcome stays unsettled after a provisional sent, then settles failed when the adapter rejection arrives", async () => {
+  // The real busy-path producer order: the harness acks `sent` immediately
+  // (the switch was delivered to the in-flight turn), then — after the requeued
+  // session consults the adapter — emits `failure` seconds later. With one
+  // active channel a first-ack-resolves impl would settle "ok" on `sent` and
+  // detach before `failure` arrives; this regresses that.
+  const h = harness([CH_A]);
   let settled = false;
   void h.outcome.then(() => {
     settled = true;
   });
-  await Promise.resolve();
+
+  h.push(frame("sent"));
+  await drainMicrotasks();
+  assert.equal(settled, false, "provisional `sent` must not resolve the pick");
+  assert.equal(h.unsubscribeCalls, 0, "subscription stays alive after `sent`");
+  assert.equal(h.cancelTimeoutCalls, 0, "timeout still armed after `sent`");
+
+  h.push(frame("failure"));
+  assert.equal(await h.outcome, "failed");
+  assert.equal(h.cancelTimeoutCalls, 1, "timeout cancelled, not awaited");
+  assert.equal(h.unsubscribeCalls, 1);
+});
+
+test("awaitLiveSwitchOutcome stays unsettled after a provisional sent, then resolves ok via the timeout when no terminal frame arrives", async () => {
+  // Busy-path success emits no positive confirmation frame — after `sent`, the
+  // backend stays silent. The pick must remain unsettled until the fallback
+  // timeout resolves "ok".
+  const h = harness([CH_A]);
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+
+  h.push(frame("sent"));
+  await drainMicrotasks();
+  assert.equal(settled, false, "provisional `sent` must not resolve the pick");
+  assert.equal(h.cancelTimeoutCalls, 0, "timeout still armed after `sent`");
+
+  h.fireTimeout();
+  assert.equal(await h.outcome, "ok");
+  assert.equal(h.unsubscribeCalls, 1, "timeout fallback unsubscribes");
+});
+
+test("awaitLiveSwitchOutcome ignores frames for a different request id or control type", async () => {
+  const h = harness([CH_A]);
+  // A replayed terminal frame from an EARLIER pick carries a different
+  // requestId; it must not advance this pick's count.
+  h.push(frame("switched", { requestId: "req-stale" }));
+  h.push({
+    type: "cancel_turn",
+    status: "sent",
+    requestId: REQUEST_ID,
+    channelId: CH_A,
+  });
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+  await drainMicrotasks();
   assert.equal(settled, false, "unrelated frames must not advance the count");
 
   h.push(frame("switched"));
@@ -129,26 +198,100 @@ test("awaitLiveSwitchOutcome ignores frames for a different model or control typ
 });
 
 test("awaitLiveSwitchOutcome resolves ok via the timeout fallback when the harness never replies", async () => {
-  const h = harness(2);
+  const h = harness([CH_A, CH_B]);
   h.fireTimeout();
   assert.equal(await h.outcome, "ok");
   assert.equal(h.unsubscribeCalls, 1, "timeout fallback unsubscribes");
 });
 
 test("awaitLiveSwitchOutcome fires the per-channel sends after subscribing", async () => {
-  const h = harness(1);
+  const h = harness([CH_A]);
   // The subscription is registered before the sends fire, so a frame arriving
-  // mid-send is never dropped. Awaiting sendStarted proves sends ran.
+  // mid-send is never dropped. Awaiting sendStarted proves sends ran. Uses a
+  // terminal-success frame (`switched`) since the provisional `sent` no longer
+  // settles the pick on its own.
   await h.sendStarted;
-  h.push(frame("sent"));
+  h.push(frame("switched"));
   assert.equal(await h.outcome, "ok");
 });
 
 test("awaitLiveSwitchOutcome with zero channels resolves ok at the timeout (no acks expected)", async () => {
-  // No active turns means channelCount 0: remaining starts at 0 but the success
-  // resolve only fires inside a frame callback, so with no frames the timeout
-  // fallback is what settles it. This documents the degenerate path.
-  const h = harness(0);
+  // No active turns means an empty channel set: the success resolve only fires
+  // inside a frame callback keyed on an expected channel, so with no frames the
+  // timeout fallback is what settles it. This documents the degenerate path.
+  const h = harness([]);
   h.fireTimeout();
+  assert.equal(await h.outcome, "ok");
+});
+
+test("awaitLiveSwitchOutcome ignores a reconnect replay of an identical terminal frame", async () => {
+  // The observer relay requests a five-minute replay on reconnect, so the SAME
+  // terminal frame for one channel can arrive twice. A scalar count would treat
+  // the replay as a second channel's ack and settle a two-channel pick early.
+  const h = harness([CH_A, CH_B]);
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+
+  h.push(frame("switched", { channelId: CH_A }));
+  h.push(frame("switched", { channelId: CH_A })); // replay of the same frame
+  await drainMicrotasks();
+  assert.equal(
+    settled,
+    false,
+    "a duplicated channel-A success must not stand in for channel B",
+  );
+
+  h.push(frame("switched", { channelId: CH_B }));
+  assert.equal(await h.outcome, "ok");
+});
+
+test("awaitLiveSwitchOutcome does not let one channel's duplicated success mask another channel's later failure", async () => {
+  // Two channels: A succeeds and its frame is replayed; B rejects late. A
+  // per-frame count would resolve "ok" on A's duplicate before B's failure and
+  // report a false success. Counting per distinct channel keeps the pick open
+  // for B, which fail-fasts to "failed".
+  const h = harness([CH_A, CH_B]);
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+
+  h.push(frame("switched", { channelId: CH_A }));
+  h.push(frame("switched", { channelId: CH_A })); // duplicate for A
+  await drainMicrotasks();
+  assert.equal(settled, false, "A's duplicate must not complete the pick");
+
+  h.push(frame("failure", { channelId: CH_B }));
+  assert.equal(await h.outcome, "failed");
+});
+
+test("awaitLiveSwitchOutcome ignores a stale result from an overlapping same-model operation", async () => {
+  // Two picks for the same model overlap: this operation is `req-new`; a prior
+  // `req-old` pick's terminal frame (same model, same channel) is still in
+  // flight. Correlating on requestId — not modelId — keeps the old result from
+  // settling the new pick.
+  const h = harness([CH_A], "req-new");
+  let settled = false;
+  void h.outcome.then(() => {
+    settled = true;
+  });
+
+  h.push({
+    type: "switch_model",
+    status: "switched",
+    requestId: "req-old",
+    channelId: CH_A,
+  });
+  await drainMicrotasks();
+  assert.equal(settled, false, "a prior same-model pick's result is inert");
+
+  h.push({
+    type: "switch_model",
+    status: "switched",
+    requestId: "req-new",
+    channelId: CH_A,
+  });
   assert.equal(await h.outcome, "ok");
 });
