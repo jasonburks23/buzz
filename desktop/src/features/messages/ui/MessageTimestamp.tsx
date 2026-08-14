@@ -3,14 +3,7 @@ import {
   formatTimeWithoutDayPeriod,
 } from "@/features/messages/lib/dateFormatters";
 import { cn } from "@/shared/lib/cn";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/shared/ui/tooltip";
-
-const TIMESTAMP_TOOLTIP_DELAY_MS = 500;
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 
 export function MessageTimestamp({
   className,
@@ -26,26 +19,21 @@ export function MessageTimestamp({
   const displayTime = hideDayPeriod ? formatTimeWithoutDayPeriod(time) : time;
 
   return (
-    <TooltipProvider
-      delayDuration={TIMESTAMP_TOOLTIP_DELAY_MS}
-      skipDelayDuration={0}
-    >
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <p
-            className={cn(
-              "shrink-0 cursor-default whitespace-nowrap text-xs font-normal leading-4 tabular-nums text-muted-foreground/55",
-              className,
-            )}
-            data-testid="message-timestamp"
-          >
-            {displayTime}
-          </p>
-        </TooltipTrigger>
-        <TooltipContent side="top">
-          {formatFullDateTime(createdAt)}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <p
+          className={cn(
+            "shrink-0 cursor-default whitespace-nowrap text-xs font-normal leading-4 tabular-nums text-muted-foreground/55",
+            className,
+          )}
+          data-testid="message-timestamp"
+        >
+          {displayTime}
+        </p>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        {formatFullDateTime(createdAt)}
+      </TooltipContent>
+    </Tooltip>
   );
 }
