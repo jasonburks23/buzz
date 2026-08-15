@@ -43,7 +43,10 @@
 use buzz_seat_clerk::{
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
-    read_state::{build_read_state_plaintext, now_secs, ReadStateWriter, SlotIdentity},
+    read_state::{
+        build_read_state_plaintext, now_secs, record_youyou_read, ReadStateWriter, SlotIdentity,
+    },
+    session_identity::SessionMarker,
     wake::WakeEmitter,
 };
 use buzz_ws_client::NostrWsConnection;
@@ -105,7 +108,15 @@ async fn read_state_round_trip() {
     let dir = tempdir().unwrap();
     let id = SlotIdentity::load_or_create(&dir.path().join("id.json")).unwrap();
     let mut writer = ReadStateWriter::new(id);
-    writer.mark_read("test-context-key".to_string(), now_secs());
+    let live = SessionMarker::new("it-live-session".to_string());
+    record_youyou_read(
+        &mut writer,
+        "test-context-key".to_string(),
+        now_secs(),
+        &live,
+        &live,
+    )
+    .expect("live marker must advance bookmark");
 
     let mut conn = NostrWsConnection::connect_authenticated(&relay_url(), &seat_keys, None)
         .await
@@ -374,7 +385,15 @@ async fn read_state_content_format_accepted_by_relay() {
     let mut contexts = HashMap::new();
     contexts.insert(Uuid::new_v4().to_string(), now_secs());
     contexts.insert(Uuid::new_v4().to_string(), now_secs() - 60);
-    writer.mark_read(contexts.keys().next().unwrap().clone(), now_secs());
+    let live = SessionMarker::new("it-live-session-2".to_string());
+    record_youyou_read(
+        &mut writer,
+        contexts.keys().next().unwrap().clone(),
+        now_secs(),
+        &live,
+        &live,
+    )
+    .expect("live marker must advance bookmark");
 
     // Sanity-check the plaintext shape (does not touch the relay).
     let plaintext =

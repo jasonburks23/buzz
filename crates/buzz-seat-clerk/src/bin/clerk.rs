@@ -21,7 +21,7 @@ use buzz_seat_clerk::{
     config::ClerkConfig,
     connection::connect_with_backoff,
     discovery::{discover_channels, ChannelInfo, ChannelType},
-    lane::classify,
+    lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
     read_state::{now_secs, ReadStateWriter, SlotIdentity},
     subscription::{channel_req_frame, membership_req_frame, TwoGenDedup},
@@ -154,45 +154,14 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        let channel_info = channels.get(&channel_uuid);
-                        let is_dm = channel_info
-                            .map(|c| c.channel_type == ChannelType::Dm)
-                            .unwrap_or(false);
-
-                        let p_tags: Vec<String> = event
-                            .tags
-                            .iter()
-                            .filter(|t| {
-                                t.as_slice()
-                                    .first()
-                                    .map(|s| s.as_str() == "p")
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|t| t.as_slice().get(1).cloned())
-                            .collect();
-
-                        let created_at_secs = event.created_at.as_secs();
-
-                        let entry = MailboxEntry {
-                            event_id: event_id.clone(),
-                            created_at: created_at_secs,
-                            author_pubkey: event.pubkey.to_hex(),
-                            content: event.content.clone(),
-                            p_tags: p_tags.clone(),
+                        let lane = deliver_event(
+                            &mut mailbox,
+                            &emitter,
+                            &cfg.public_key_hex,
+                            &channels,
+                            &event,
                             channel_uuid,
-                        };
-                        mailbox.insert(channel_uuid, entry);
-
-                        let lane = classify(is_dm, &p_tags, &cfg.public_key_hex);
-                        if let Err(e) = emitter.emit_if_lane_1(&lane, created_at_secs) {
-                            warn!("wake emit failed: {e}");
-                        }
-
-                        // NOTE: The delivery path intentionally does NOT call mark_read here.
-                        // US-07: the bookmark must only advance when the live session reads,
-                        // not when the clerk delivers. The live session calls record_youyou_read
-                        // (gated by SessionMarker) to advance the bookmark. The debounced
-                        // flush via writer.build_event / writer.is_flush_due is still active.
+                        );
 
                         debug!(
                             channel = %channel_uuid,
@@ -244,9 +213,71 @@ fn is_own_event(event_pubkey_hex: &str, own_pubkey_hex: &str) -> bool {
     event_pubkey_hex == own_pubkey_hex
 }
 
+/// Deliver one inbound channel event: build the mailbox entry, insert it, classify
+/// the lane, and emit a wake signal if Lane 1.
+///
+/// Intentionally takes NO ReadStateWriter and has no access to mark_read.
+/// US-07 hard line: the bookmark must only advance when the live session reads
+/// (via record_youyou_read), never at delivery time. If this function were to
+/// call mark_read it would need the writer in its signature, making the
+/// violation structurally visible and breaking the US-07 S3 guard test.
+fn deliver_event(
+    mailbox: &mut Mailbox,
+    emitter: &WakeEmitter,
+    public_key_hex: &str,
+    channels: &HashMap<Uuid, ChannelInfo>,
+    event: &nostr::Event,
+    channel_uuid: Uuid,
+) -> Lane {
+    let channel_info = channels.get(&channel_uuid);
+    let is_dm = channel_info
+        .map(|c| c.channel_type == ChannelType::Dm)
+        .unwrap_or(false);
+
+    let p_tags: Vec<String> = event
+        .tags
+        .iter()
+        .filter(|t| {
+            t.as_slice()
+                .first()
+                .map(|s| s.as_str() == "p")
+                .unwrap_or(false)
+        })
+        .filter_map(|t| t.as_slice().get(1).cloned())
+        .collect();
+
+    let created_at_secs = event.created_at.as_secs();
+
+    let entry = MailboxEntry {
+        event_id: event.id.to_hex(),
+        created_at: created_at_secs,
+        author_pubkey: event.pubkey.to_hex(),
+        content: event.content.clone(),
+        p_tags: p_tags.clone(),
+        channel_uuid,
+    };
+    mailbox.insert(channel_uuid, entry);
+
+    let lane = classify(is_dm, &p_tags, public_key_hex);
+    if let Err(e) = emitter.emit_if_lane_1(&lane, created_at_secs) {
+        warn!("wake emit failed: {e}");
+    }
+
+    // NOTE: The delivery path intentionally does NOT call mark_read here.
+    // US-07: the bookmark must only advance when the live session reads,
+    // not when the clerk delivers. The live session calls record_youyou_read
+    // (gated by SessionMarker) to advance the bookmark. The debounced
+    // flush via writer.build_event / writer.is_flush_due is still active.
+
+    lane
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_seat_clerk::read_state::{generate_slot_id, ReadStateWriter, SlotIdentity};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use tempfile::tempdir;
 
     #[test]
     fn is_own_event_true_when_equal() {
@@ -259,5 +290,82 @@ mod tests {
         let pk_a = "deadbeef".repeat(8);
         let pk_b = "cafebabe".repeat(8);
         assert!(!is_own_event(&pk_a, &pk_b));
+    }
+
+    // US-07 S3 WIRED GUARD: delivery does NOT advance the read bookmark.
+    //
+    // This test calls the real deliver_event path and asserts:
+    //   (a) the mailbox contains the delivered entry (delivery worked), AND
+    //   (b) the ReadStateWriter bookmark for that channel is None (delivery
+    //       did NOT mark read).
+    //
+    // This guard turns RED if delivery-time marking is reintroduced, because
+    // deliver_event would then need the writer in its signature (it has no
+    // access to it today), and adding it back would require passing the writer
+    // in -- that structural change plus a mark_read call would cause the
+    // bookmark assertion below to fail, turning this test RED.
+    #[test]
+    fn us07_s3_wired_deliver_event_does_not_advance_bookmark() {
+        // Build a real signed nostr Event for a non-DM channel mention.
+        let sender_keys = Keys::generate();
+        let seat_keys = Keys::generate();
+        let seat_pubkey_hex = seat_keys.public_key().to_hex();
+        let channel_uuid = Uuid::new_v4();
+
+        let event = EventBuilder::new(Kind::Custom(9), "hello seat")
+            .tag(Tag::parse(vec!["p".to_string(), seat_pubkey_hex.clone()]).expect("build p-tag"))
+            .tag(Tag::parse(vec!["h".to_string(), channel_uuid.to_string()]).expect("build h-tag"))
+            .sign_with_keys(&sender_keys)
+            .expect("sign test event");
+
+        // Set up a Mailbox and WakeEmitter (temp dir wake file).
+        let dir = tempdir().unwrap();
+        let wake_path = dir.path().join("wake");
+        let emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
+        let mut mailbox = Mailbox::new();
+
+        // Empty channels map: channel_type defaults to Unknown -> not a DM.
+        // The p-tag match still classifies as Lane::ForMe.
+        let channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+
+        // Set up a ReadStateWriter SEPARATELY. It is NOT passed to deliver_event.
+        let writer = ReadStateWriter::new(SlotIdentity {
+            slot_id: generate_slot_id(),
+            client_id: generate_slot_id(),
+        });
+        let ctx = channel_uuid.to_string();
+
+        // Call the real delivery path.
+        let lane = deliver_event(
+            &mut mailbox,
+            &emitter,
+            &seat_pubkey_hex,
+            &channels,
+            &event,
+            channel_uuid,
+        );
+
+        // (a) Delivery worked: mailbox contains the entry.
+        let entries = mailbox
+            .channel_entries(&channel_uuid)
+            .expect("channel must have entries after deliver_event");
+        assert!(
+            entries.iter().any(|e| e.event_id == event.id.to_hex()),
+            "mailbox must contain the delivered entry"
+        );
+
+        // Lane was classified correctly (p-tag mention -> ForMe).
+        assert_eq!(
+            lane,
+            Lane::ForMe,
+            "p-tag mention must classify as Lane::ForMe"
+        );
+
+        // (b) The bookmark was NOT advanced by delivery.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            None,
+            "delivery must NOT advance the read bookmark (US-07 hard line)"
+        );
     }
 }

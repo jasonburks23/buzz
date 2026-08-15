@@ -21,6 +21,17 @@ use thiserror::Error;
 #[derive(Clone, PartialEq, Eq)]
 pub struct SessionMarker(pub(crate) String);
 
+impl SessionMarker {
+    /// Construct a marker from a session-id string.
+    ///
+    /// Exposed `pub` so integration tests (external crate) can build markers
+    /// for use with `record_youyou_read`. Application code should use
+    /// `load_live_marker` instead.
+    pub fn new(id: String) -> Self {
+        Self(id)
+    }
+}
+
 impl std::fmt::Debug for SessionMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SessionMarker(<id>)")

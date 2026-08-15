@@ -98,7 +98,7 @@ impl ReadStateWriter {
     }
 
     /// Record a context as read. `ctx` is a channel UUID, `"thread:<hex>"`, or `"msg:<hex>"`.
-    pub fn mark_read(&mut self, ctx: String, ts: u64) {
+    pub(crate) fn mark_read(&mut self, ctx: String, ts: u64) {
         let entry = self.pending_contexts.entry(ctx).or_insert(0);
         if ts > *entry {
             *entry = ts;
