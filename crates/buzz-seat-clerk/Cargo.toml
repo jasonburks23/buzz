@@ -30,4 +30,5 @@ uuid           = { workspace = true }
 rand           = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"
