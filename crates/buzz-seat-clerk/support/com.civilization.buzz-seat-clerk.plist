@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.civilization.buzz-seat-clerk</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Replace with actual binary path after `cargo install` or `cargo build --release`. -->
+    <string>/usr/local/bin/clerk</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Set SEAT_NSEC and RELAY_URL in a launchd-managed secrets file or
+         via `launchctl setenv` before loading this plist. Never store nsec
+         in plaintext in this file. -->
+    <key>SEAT_NSEC</key>
+    <string>REPLACE_WITH_BECH32_NSEC</string>
+    <key>RELAY_URL</key>
+    <string>ws://localhost:3000</string>
+    <key>WAKE_FILE</key>
+    <string>/tmp/buzz-seat-clerk.wake</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Watch the wake file: when it changes, a supervisor script or launchd
+       WatchPaths agent can fire to wake the seat terminal. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/buzz-seat-clerk.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/buzz-seat-clerk.stderr.log</string>
+</dict>
+</plist>
