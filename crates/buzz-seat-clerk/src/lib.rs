@@ -43,5 +43,6 @@ pub mod error;
 pub mod lane;
 pub mod mailbox;
 pub mod read_state;
+pub mod session_identity;
 pub mod subscription;
 pub mod wake;
