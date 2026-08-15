@@ -119,6 +119,14 @@ impl ReadStateWriter {
         !self.pending_contexts.is_empty() && now_secs >= self.last_flush_wall + DEBOUNCE_SECS
     }
 
+    /// Returns the last-read unix seconds for a context key, or None if absent.
+    ///
+    /// Used by the reconnect path to set `since` on per-room subscriptions, so
+    /// the relay only backfills messages the seat has not yet read.
+    pub fn read_at_for(&self, ctx: &str) -> Option<u64> {
+        self.pending_contexts.get(ctx).copied()
+    }
+
     /// Build a signed kind-30078 event from pending contexts.
     ///
     /// Caller provides `now_secs` (wall clock) and the seat `keys` for signing + NIP-44.
@@ -275,6 +283,25 @@ mod tests {
                 .expect("decrypt-to-self must succeed");
 
         assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn read_at_for_returns_stored_timestamp_or_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let id = SlotIdentity::load_or_create(&path).unwrap();
+        let mut writer = ReadStateWriter::new(id);
+
+        // Unknown context returns None.
+        assert_eq!(writer.read_at_for("unknown-ctx"), None);
+
+        // After marking a context read, read_at_for returns the timestamp.
+        let ts = 1_700_000_042u64;
+        writer.mark_read("chan-abc".to_string(), ts);
+        assert_eq!(writer.read_at_for("chan-abc"), Some(ts));
+
+        // A different unknown key still returns None.
+        assert_eq!(writer.read_at_for("chan-xyz"), None);
     }
 
     #[test]
