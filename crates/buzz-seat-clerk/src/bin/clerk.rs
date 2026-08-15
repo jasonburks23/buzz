@@ -188,8 +188,11 @@ async fn main() -> Result<()> {
                             warn!("wake emit failed: {e}");
                         }
 
-                        // Mark channel as read-pending (debounced flush will write kind:30078).
-                        writer.mark_read(channel_uuid.to_string(), created_at_secs);
+                        // NOTE: The delivery path intentionally does NOT call mark_read here.
+                        // US-07: the bookmark must only advance when the live session reads,
+                        // not when the clerk delivers. The live session calls record_youyou_read
+                        // (gated by SessionMarker) to advance the bookmark. The debounced
+                        // flush via writer.build_event / writer.is_flush_due is still active.
 
                         debug!(
                             channel = %channel_uuid,

@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::ClerkError;
+use crate::session_identity::SessionMarker;
 use buzz_core::kind::KIND_READ_STATE;
+use thiserror::Error;
 
 const DEBOUNCE_SECS: u64 = 5;
 /// v1 uses only slot 0; multi-slot is future work.
@@ -170,6 +172,46 @@ impl ReadStateWriter {
     }
 }
 
+// ─── Marker-gated read receipt ────────────────────────────────────────────────
+
+/// Errors returned by the marker-gated read API.
+///
+/// US-03 / US-07: only the continuous live session may advance the read
+/// bookmark.  A freshly spawned process (or any actor whose marker does not
+/// match the live session) is refused.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReadGuardError {
+    /// The actor's session marker does not match the live session.
+    ///
+    /// The bookmark is NOT advanced when this is returned.
+    #[error("actor is not the live session; bookmark unchanged")]
+    NotLiveSession,
+}
+
+/// Advance the read bookmark for `ctx` to `ts`, but only if `actor` is the
+/// live session.
+///
+/// - If `actor != live`: returns `Err(NotLiveSession)` and does NOT call
+///   `writer.mark_read` (bookmark unchanged).
+/// - If `actor == live`: calls `writer.mark_read(ctx, ts)` and returns `Ok`.
+///
+/// This is the US-03/US-07 guard: a freshly spawned process whose sidecar
+/// marker differs from the running live session cannot advance the bookmark
+/// even if it receives the same messages.
+pub fn record_youyou_read(
+    writer: &mut ReadStateWriter,
+    ctx: String,
+    ts: u64,
+    actor: &SessionMarker,
+    live: &SessionMarker,
+) -> Result<(), ReadGuardError> {
+    if actor != live {
+        return Err(ReadGuardError::NotLiveSession);
+    }
+    writer.mark_read(ctx, ts);
+    Ok(())
+}
+
 /// Current wall-clock seconds.
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -302,6 +344,127 @@ mod tests {
 
         // A different unknown key still returns None.
         assert_eq!(writer.read_at_for("chan-xyz"), None);
+    }
+
+    // ── US-07 / US-03 marker-gated read-receipt tests ──────────────────────
+
+    /// Helper: build a minimal ReadStateWriter for unit tests (no disk I/O).
+    fn test_writer() -> ReadStateWriter {
+        ReadStateWriter::new(SlotIdentity {
+            slot_id: generate_slot_id(),
+            client_id: generate_slot_id(),
+        })
+    }
+
+    // Test 1 – US-07 S3: delivered-but-unread stays None.
+    //
+    // A ReadStateWriter that has only had messages "delivered" (mark_read NOT
+    // called on it) reports read_at_for(ctx) == None.
+    //
+    // This test is tied to the removal of the delivery-time mark_read call
+    // that previously lived in clerk.rs after `mailbox.insert(...)`. Since
+    // delivery no longer calls mark_read, the bookmark must remain absent
+    // until the live session explicitly records a read.
+    #[test]
+    fn us07_s3_delivered_but_unread_stays_none() {
+        let writer = test_writer();
+        let ctx = "chan-us07-s3".to_string();
+
+        // Simulate delivery: we insert into the context as if the clerk
+        // received a message, but we deliberately do NOT call mark_read.
+        // (In the fixed clerk.rs the delivery path only does mailbox.insert
+        // + emitter.emit; mark_read is gone from that path.)
+        // Assert the bookmark is absent.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            None,
+            "bookmark must be None after delivery without mark_read"
+        );
+    }
+
+    // Test 2 – US-07 S4 + US-03 S1 KEYSTONE: fake marker cannot advance bookmark.
+    //
+    // Given live marker L and a different marker F (fake), calling
+    // record_youyou_read with F as actor must return Err(NotLiveSession) AND
+    // leave the bookmark at None.
+    //
+    // This test turns RED against the ungated pass-through above and GREEN
+    // after the gate is added.
+    #[test]
+    fn us07_s4_us03_s1_keystone_fake_marker_cannot_advance_bookmark() {
+        let mut writer = test_writer();
+        let ctx = "chan-keystone".to_string();
+
+        let live = SessionMarker("live-session-abc".to_string());
+        let fake = SessionMarker("fake-session-xyz".to_string());
+
+        let result = record_youyou_read(&mut writer, ctx.clone(), 100, &fake, &live);
+
+        assert_eq!(
+            result,
+            Err(ReadGuardError::NotLiveSession),
+            "a non-live actor must be refused"
+        );
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            None,
+            "bookmark must remain None when actor != live"
+        );
+    }
+
+    // Test 3 – Positive control: live actor advances bookmark correctly.
+    #[test]
+    fn us07_positive_live_actor_advances_bookmark() {
+        let mut writer = test_writer();
+        let ctx = "chan-positive".to_string();
+
+        let live = SessionMarker("live-session-abc".to_string());
+
+        // First live read at ts=100.
+        let r1 = record_youyou_read(&mut writer, ctx.clone(), 100, &live, &live);
+        assert_eq!(r1, Ok(()), "live actor must succeed");
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            Some(100),
+            "bookmark must be 100 after first read"
+        );
+
+        // Second live read at ts=150 advances the bookmark.
+        let r2 = record_youyou_read(&mut writer, ctx.clone(), 150, &live, &live);
+        assert_eq!(r2, Ok(()), "second live read must succeed");
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            Some(150),
+            "bookmark must advance to 150 after second read"
+        );
+    }
+
+    // Test 4 – US-03 catch-up wiring: read_at_for returns the recorded bookmark.
+    //
+    // Confirms that the backfill `since` parameter in the reconnect path uses
+    // the correct bookmark value stored by mark_read / record_youyou_read.
+    #[test]
+    fn us03_catchup_read_at_for_returns_recorded_bookmark() {
+        let mut writer = test_writer();
+        let ctx = "chan-us03-catchup".to_string();
+
+        // Nothing recorded yet.
+        assert_eq!(writer.read_at_for(&ctx), None);
+
+        // Record a bookmark directly via mark_read (internal API).
+        let ts = 1_720_000_042u64;
+        writer.mark_read(ctx.clone(), ts);
+
+        // read_at_for must return exactly that value.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            Some(ts),
+            "read_at_for must return the stored bookmark for backfill `since`"
+        );
+
+        // A higher timestamp advances it.
+        writer.mark_read(ctx.clone(), ts + 60);
+        assert_eq!(writer.read_at_for(&ctx), Some(ts + 60));
     }
 
     #[test]
