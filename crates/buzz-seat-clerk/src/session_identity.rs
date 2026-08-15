@@ -49,6 +49,13 @@ pub enum SessionIdentityError {
     /// The sidecar JSON was read but does not contain the expected fields.
     #[error("malformed sidecar JSON: {reason}")]
     MalformedSidecar { reason: String },
+
+    /// The session_id field in the sidecar is empty or whitespace-only.
+    ///
+    /// An empty marker would allow two unrelated fakes to match each other,
+    /// which defeats the live-seat guard entirely.
+    #[error("sidecar session_id is empty or whitespace-only")]
+    EmptySessionId,
 }
 
 // ─── Sidecar shape ───────────────────────────────────────────────────────────
@@ -83,6 +90,9 @@ pub fn load_live_marker(
         serde_json::from_str(&raw).map_err(|e| SessionIdentityError::MalformedSidecar {
             reason: e.to_string(),
         })?;
+    if parsed.session_id.trim().is_empty() {
+        return Err(SessionIdentityError::EmptySessionId);
+    }
     Ok(SessionMarker(parsed.session_id))
 }
 
@@ -184,14 +194,8 @@ mod tests {
     // Loader test: write a temp sidecar and verify the loader returns the correct marker.
     #[test]
     fn loader_reads_marker_from_sidecar() {
-        let tmp = std::env::temp_dir().join(format!(
-            "buzz-test-sidecar-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
 
         let session_id = "test-sid";
         let sidecar_path = tmp.join(format!("claude-seat-id-{session_id}.json"));
@@ -202,22 +206,66 @@ mod tests {
         )
         .unwrap();
 
-        let result = load_live_marker(&tmp, session_id);
+        let result = load_live_marker(tmp, session_id);
         assert!(result.is_ok(), "loader failed: {:?}", result);
         assert_eq!(result.unwrap(), SessionMarker(session_id.to_string()));
-
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // Loader test: missing file returns SidecarMissing.
     #[test]
     fn loader_returns_missing_error_for_absent_file() {
-        let tmp = std::env::temp_dir().join("buzz-test-missing-99999");
-        // Do NOT create this directory or the sidecar file.
-        let result = load_live_marker(&tmp, "nonexistent-sid");
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+        // Do NOT create the sidecar file.
+        let result = load_live_marker(tmp, "nonexistent-sid");
         assert!(
             matches!(result, Err(SessionIdentityError::SidecarMissing { .. })),
             "expected SidecarMissing, got {:?}",
+            result
+        );
+    }
+
+    // Loader test: empty or whitespace-only session_id returns EmptySessionId.
+    #[test]
+    fn loader_rejects_empty_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+
+        // Write a sidecar with session_id = "".
+        let empty_sidecar = tmp.join("claude-seat-id-.json");
+        std::fs::write(&empty_sidecar, r#"{"session_id":""}"#).unwrap();
+        let result = load_live_marker(tmp, "");
+        assert!(
+            matches!(result, Err(SessionIdentityError::EmptySessionId)),
+            "expected EmptySessionId for empty string, got {:?}",
+            result
+        );
+
+        // Write a sidecar with session_id = "   " (whitespace only).
+        let ws_sidecar = tmp.join("claude-seat-id-   .json");
+        std::fs::write(&ws_sidecar, r#"{"session_id":"   "}"#).unwrap();
+        let result = load_live_marker(tmp, "   ");
+        assert!(
+            matches!(result, Err(SessionIdentityError::EmptySessionId)),
+            "expected EmptySessionId for whitespace-only string, got {:?}",
+            result
+        );
+    }
+
+    // Loader test: malformed JSON in sidecar returns MalformedSidecar.
+    #[test]
+    fn loader_rejects_malformed_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+
+        let session_id = "test-malformed";
+        let sidecar_path = tmp.join(format!("claude-seat-id-{session_id}.json"));
+        std::fs::write(&sidecar_path, "not json {").unwrap();
+
+        let result = load_live_marker(tmp, session_id);
+        assert!(
+            matches!(result, Err(SessionIdentityError::MalformedSidecar { .. })),
+            "expected MalformedSidecar, got {:?}",
             result
         );
     }
