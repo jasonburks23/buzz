@@ -7,14 +7,47 @@
 
 use std::collections::HashMap;
 
-use nostr::{Alphabet, Filter, Kind, SingleLetterTag};
+use base64::Engine as _;
+use nostr::{EventBuilder, JsonUtil, Kind, Tag};
 use reqwest::Client;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::config::ClerkConfig;
 use crate::error::ClerkError;
 use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA};
+
+/// Build a NIP-98 HTTP Auth token (kind-27235) for a POST request.
+///
+/// Tag set mirrors crates/buzz-cli/src/client.rs `sign_nip98`:
+///   ["u", url], ["method", "POST"], ["nonce", uuid-v4], ["payload", hex(sha256(body))]
+///
+/// The body bytes are hashed here so the hash matches the bytes actually sent.
+/// Never logs the signing key, the token, or message content.
+fn make_nip98_post_token(cfg: &ClerkConfig, url: &str, body: &[u8]) -> Result<String, ClerkError> {
+    let payload_hash = hex::encode(Sha256::digest(body));
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let tags = vec![
+        Tag::parse(["u", url]).map_err(|e| ClerkError::Discovery(format!("build u tag: {e}")))?,
+        Tag::parse(["method", "POST"])
+            .map_err(|e| ClerkError::Discovery(format!("build method tag: {e}")))?,
+        Tag::parse(["nonce", &nonce])
+            .map_err(|e| ClerkError::Discovery(format!("build nonce tag: {e}")))?,
+        Tag::parse(["payload", &payload_hash])
+            .map_err(|e| ClerkError::Discovery(format!("build payload tag: {e}")))?,
+    ];
+    let event = EventBuilder::new(Kind::Custom(27235), "")
+        .tags(tags)
+        .sign_with_keys(&cfg.keys)
+        .map_err(|e| ClerkError::Discovery(format!("NIP-98 signing failed: {e}")))?;
+    let json = event.as_json();
+    Ok(format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(json.as_bytes())
+    ))
+}
 
 /// Metadata about a discovered channel.
 #[derive(Debug, Clone)]
@@ -126,25 +159,30 @@ pub fn merge_channel_info(uuids: Vec<Uuid>, meta_events: &Value) -> HashMap<Uuid
 ///
 /// * `relay_http_url` - HTTP base URL of the relay (e.g. `http://localhost:3000`).
 /// * `seat_pubkey_hex` - the seat's hex-encoded public key.
-/// * `nip98_token` - NIP-98 Authorization header value (built by the caller).
+/// * `cfg` - clerk config providing the signing keys for NIP-98 auth tokens.
 ///
-/// The function does not log secrets. The `nip98_token` is passed as a header
-/// value only and is never recorded in tracing spans.
+/// Each request builds its own NIP-98 token from the exact bytes being sent so
+/// the relay's payload-hash check passes. The token is passed as a header value
+/// only and is never recorded in tracing spans.
 pub async fn discover_channels(
     http: &Client,
     relay_http_url: &str,
     seat_pubkey_hex: &str,
-    nip98_token: &str,
+    cfg: &ClerkConfig,
 ) -> Result<HashMap<Uuid, ChannelInfo>, ClerkError> {
     // Step 1: kind:39002 where #p = seat_pubkey
-    let p_tag = SingleLetterTag::lowercase(Alphabet::P);
-    let member_filter = Filter::new()
-        .kind(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16))
-        .custom_tags(p_tag, [seat_pubkey_hex]);
-    let member_body = serde_json::to_vec(&[member_filter])?;
+    // Filter shape mirrors buzz-cli's cmd_list_channels member path (channels.rs):
+    //   {"kinds":[39002],"#p":[pubkey_hex]}
+    let member_filter = serde_json::json!({
+        "kinds": [KIND_NIP29_GROUP_MEMBERS],
+        "#p": [seat_pubkey_hex],
+    });
+    let member_body = serde_json::to_vec(&[&member_filter])?;
+    let query_url = format!("{relay_http_url}/query");
+    let member_token = make_nip98_post_token(cfg, &query_url, &member_body)?;
     let member_events: Value = http
-        .post(format!("{relay_http_url}/query"))
-        .header("Authorization", nip98_token)
+        .post(&query_url)
+        .header("Authorization", member_token)
         .header("Content-Type", "application/json")
         .body(member_body)
         .send()
@@ -161,15 +199,18 @@ pub async fn discover_channels(
     }
 
     // Step 2: kind:39000 for discovered UUIDs
-    let d_tag = SingleLetterTag::lowercase(Alphabet::D);
+    // Filter shape mirrors buzz-cli's cmd_list_channels member path (channels.rs):
+    //   {"kinds":[39000],"#d":[uuid1, uuid2, ...]}
     let d_values: Vec<String> = uuids.iter().map(|u| u.to_string()).collect();
-    let meta_filter = Filter::new()
-        .kind(Kind::Custom(KIND_NIP29_GROUP_METADATA as u16))
-        .custom_tags(d_tag, d_values);
-    let meta_body = serde_json::to_vec(&[meta_filter])?;
+    let meta_filter = serde_json::json!({
+        "kinds": [KIND_NIP29_GROUP_METADATA],
+        "#d": d_values,
+    });
+    let meta_body = serde_json::to_vec(&[&meta_filter])?;
+    let meta_token = make_nip98_post_token(cfg, &query_url, &meta_body)?;
     let meta_events: Value = http
-        .post(format!("{relay_http_url}/query"))
-        .header("Authorization", nip98_token)
+        .post(&query_url)
+        .header("Authorization", meta_token)
         .header("Content-Type", "application/json")
         .body(meta_body)
         .send()
@@ -259,5 +300,77 @@ mod tests {
         }]);
         let map = merge_channel_info(vec![uuid], &meta_events);
         assert!(map.is_empty(), "archived channels must be excluded");
+    }
+
+    /// NIP-98 token carries a payload tag whose hash equals sha256 of the body.
+    ///
+    /// This is the fix regression-guard: before the fix, the token had no payload
+    /// tag and the relay rejected it with an empty result.
+    #[test]
+    fn nip98_token_payload_tag_matches_body_hash() {
+        // Minimal deterministic keys (scalar = 1 is the smallest valid secp256k1 key).
+        let keys =
+            nostr::Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("valid test key");
+        let cfg = crate::config::ClerkConfig {
+            keys,
+            public_key_hex: String::new(),
+            relay_url: String::new(),
+            wake_file: String::new(),
+        };
+
+        // Use a concrete body matching the member-filter shape (no raw-string tricks needed).
+        let body = b"[{\"kinds\":[39002],\"#p\":[\"deadbeef\"]}]";
+        let url = "https://relay.example/query";
+
+        let token = make_nip98_post_token(&cfg, url, body).expect("token must build");
+
+        // Decode and parse the signed event JSON from the Nostr header.
+        let encoded = token.strip_prefix("Nostr ").expect("Nostr prefix");
+        let json_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 decode");
+        let event = nostr::Event::from_json(std::str::from_utf8(&json_bytes).expect("utf8"))
+            .expect("valid event JSON");
+
+        // Verify the event is well-formed.
+        event.verify().expect("event signature valid");
+
+        // The event must be kind 27235.
+        assert_eq!(event.kind.as_u16(), 27235, "must be kind 27235");
+
+        // Collect tags into a searchable Vec<Vec<String>>.
+        let tags: Vec<Vec<String>> = event.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+
+        // "u" tag must equal the exact URL.
+        assert!(
+            tags.iter().any(|t| t.as_slice() == ["u", url]),
+            "u tag must equal the request URL"
+        );
+
+        // "method" tag must be POST.
+        assert!(
+            tags.iter().any(|t| t.as_slice() == ["method", "POST"]),
+            "method tag must be POST"
+        );
+
+        // "nonce" tag must be present.
+        assert!(
+            tags.iter()
+                .any(|t| t.first().map(String::as_str) == Some("nonce")),
+            "nonce tag must be present"
+        );
+
+        // "payload" tag must be present and its value must equal hex(sha256(body)).
+        let expected_hash = hex::encode(Sha256::digest(body));
+        let payload_tag = tags
+            .iter()
+            .find(|t| t.first().map(String::as_str) == Some("payload"))
+            .expect("payload tag must be present");
+        assert_eq!(
+            payload_tag.get(1).map(String::as_str),
+            Some(expected_hash.as_str()),
+            "payload hash must equal sha256 of the request body"
+        );
     }
 }

@@ -65,21 +65,16 @@ async fn main() -> Result<()> {
         let mut conn = connect_with_backoff(&cfg.relay_url, &cfg.keys, None).await?;
 
         // Discover rooms via REST.
-        let nip98_token = build_nip98_token(&cfg, &relay_http_url)?;
-        let mut channels: HashMap<Uuid, ChannelInfo> = match discover_channels(
-            &http,
-            &relay_http_url,
-            &cfg.public_key_hex,
-            &nip98_token,
-        )
-        .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("channel discovery failed: {e}; proceeding with empty set");
-                HashMap::new()
-            }
-        };
+        // Token generation is deferred into discover_channels so the payload hash
+        // covers the exact bytes each request sends.
+        let mut channels: HashMap<Uuid, ChannelInfo> =
+            match discover_channels(&http, &relay_http_url, &cfg.public_key_hex, &cfg).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("channel discovery failed: {e}; proceeding with empty set");
+                    HashMap::new()
+                }
+            };
         info!("discovered {} channel(s)", channels.len());
 
         // Global membership subscription.
@@ -230,24 +225,6 @@ fn extract_h_tag(event: &nostr::Event) -> Option<Uuid> {
         })
         .and_then(|t| t.as_slice().get(1))
         .and_then(|v| v.parse::<Uuid>().ok())
-}
-
-fn build_nip98_token(cfg: &ClerkConfig, relay_http_url: &str) -> Result<String> {
-    // NIP-98 HTTP Auth: sign a kind-27235 event with the relay URL and method.
-    use nostr::{EventBuilder, Kind, Tag};
-    let tags = vec![
-        Tag::parse(vec!["u".to_owned(), format!("{relay_http_url}/query")]).unwrap(),
-        Tag::parse(vec!["method".to_owned(), "POST".to_owned()]).unwrap(),
-    ];
-    let event = EventBuilder::new(Kind::Custom(27235), "")
-        .tags(tags)
-        .sign_with_keys(&cfg.keys)
-        .context("sign NIP-98 event")?;
-    let encoded = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        serde_json::to_string(&event)?,
-    );
-    Ok(format!("Nostr {encoded}"))
 }
 
 // Suppress unused-import lint: KIND_MEMBER_REMOVED_NOTIFICATION is imported
