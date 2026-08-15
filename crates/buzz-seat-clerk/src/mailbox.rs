@@ -64,6 +64,11 @@ impl Mailbox {
     pub fn channel_entries(&self, channel: &Uuid) -> Option<&[MailboxEntry]> {
         self.rooms.get(channel).map(|v| v.as_slice())
     }
+
+    /// Return an iterator over all channel UUIDs known to this mailbox.
+    pub fn channel_ids(&self) -> impl Iterator<Item = &Uuid> {
+        self.rooms.keys()
+    }
 }
 
 impl Default for Mailbox {
