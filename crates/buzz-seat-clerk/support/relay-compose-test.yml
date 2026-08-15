@@ -90,6 +90,20 @@ services:
       retries: 10
       start_period: 10s
 
+  # Creates the media bucket the relay's A3 git-conformance probe requires.
+  # Without this the relay exits on startup with NoSuchBucket.
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio:9000 minioadmin minioadmin &&
+      mc mb -p m/buzz-test-media &&
+      echo bucket-ready
+      "
+
   relay:
     image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
     depends_on:
@@ -99,7 +113,17 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
     environment:
+      # RELAY_URL is the relay's own public address. It must match the port the
+      # tests connect to (3099), or the relay provisions its community for the
+      # wrong host and rejects connections with "no community for this host".
+      RELAY_URL: ws://localhost:3099
+      # Skip the A3 git object-store conformance probe on the test relay. The
+      # clerk tests do not exercise git object-store, and the probe races 32
+      # concurrent S3 ops, which is flaky under colima and can hang startup.
+      BUZZ_GIT_CONFORMANCE_PROBE: "false"
       DATABASE_URL: postgres://buzz:buzz@postgres:5432/buzz_test
       REDIS_URL: redis://redis:6379
       BUZZ_S3_ENDPOINT: http://minio:9000
@@ -115,7 +139,7 @@ services:
       - "3099:3099"
       - "8099:8099"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8099/_liveness"]
       interval: 5s
       timeout: 5s
       retries: 20

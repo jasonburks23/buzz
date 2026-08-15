@@ -211,7 +211,11 @@ async fn lane_1_message_delivered_and_wake_written() {
     let mention_event = EventBuilder::new(Kind::Custom(9), "hello seat you have a message")
         // p-tag = seat pubkey: triggers Lane::ForMe in classify()
         .tag(nostr::Tag::parse(vec!["p".to_string(), seat_pubkey_hex.clone()]).unwrap())
-        // e-tag = synthetic channel root (Buzz relay expects a 64-char hex event ID for kind-9)
+        // h-tag = room UUID: Buzz REQUIRES kind-9 (channel message) events to carry
+        // an ["h", room_id] tag naming the room. Without it the relay rejects with
+        // "invalid: channel-scoped events must include an h tag".
+        .tag(nostr::Tag::parse(vec!["h".to_string(), channel_uuid.to_string()]).unwrap())
+        // e-tag = synthetic channel root (threading anchor; kept for reply-context realism)
         .tag(nostr::Tag::parse(vec!["e".to_string(), synthetic_root_id]).unwrap())
         .sign_with_keys(&sender_keys)
         .expect("sign mention event");

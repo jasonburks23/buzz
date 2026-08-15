@@ -1372,6 +1372,7 @@ name = "buzz-seat-clerk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "buzz-core",
  "buzz-sdk",
  "buzz-ws-client",
