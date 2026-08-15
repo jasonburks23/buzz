@@ -1,0 +1,122 @@
+# Isolated test relay for buzz-seat-clerk integration tests.
+#
+# Port assignments avoid collisions with the pilot relay (port 3000)
+# and the harness stack (ports 5471, 6471, 9471).
+#
+#   postgres : 5499 -> container 5432
+#   redis    : 6399 -> container 6379
+#   minio    : 9099 -> container 9000
+#   relay    : 3099 -> container 3099
+#
+# Usage (from the repo root):
+#
+#   docker compose \
+#     -f crates/buzz-seat-clerk/support/relay-compose-test.yml \
+#     -p buzz-clerk-it \
+#     up -d
+#
+# NEVER use the default project name or container_name values -- the -p flag
+# keeps this stack isolated from both the dev stack (name: buzz) and the
+# harness stack (buzz-harness).
+#
+# After the relay is healthy, run migrations against the test database:
+#
+#   DATABASE_URL=postgres://buzz:buzz@localhost:5499/buzz_test \
+#     cargo run -p buzz-admin -- migrate
+#
+# Then run the ignored integration tests:
+#
+#   TEST_RELAY_URL=ws://localhost:3099 \
+#   SEAT_NSEC=<a fresh nsec; generate with `cargo run -p buzz-admin -- gen-key`> \
+#   RELAY_URL=ws://localhost:3099 \
+#     cargo test -p buzz-seat-clerk -- --ignored
+#
+# To tear down:
+#
+#   docker compose \
+#     -f crates/buzz-seat-clerk/support/relay-compose-test.yml \
+#     -p buzz-clerk-it \
+#     down -v
+#
+# NOTE: the relay image tag is ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}, matching
+# the production compose at deploy/compose/compose.yml. Confirm the tag is
+# available in GHCR before running. To use a locally built image instead:
+#
+#   BUZZ_IMAGE=buzz-relay:local \
+#     docker compose -f ... -p buzz-clerk-it up -d
+#
+# HARD RULE: do NOT modify or reference containers from the pilot stack
+# (buzz-prod-relay-1, buzz-prod-postgres-1, etc.).
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: buzz_test
+      POSTGRES_USER: buzz
+      POSTGRES_PASSWORD: buzz
+    ports:
+      - "5499:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buzz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6399:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9099:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  relay:
+    image: ${BUZZ_IMAGE:-ghcr.io/block/buzz:main}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://buzz:buzz@postgres:5432/buzz_test
+      REDIS_URL: redis://redis:6379
+      BUZZ_S3_ENDPOINT: http://minio:9000
+      BUZZ_S3_ADDRESSING_STYLE: path
+      BUZZ_S3_ACCESS_KEY: minioadmin
+      BUZZ_S3_SECRET_KEY: minioadmin
+      BUZZ_S3_BUCKET: buzz-test-media
+      BUZZ_BIND_ADDR: 0.0.0.0:3099
+      BUZZ_HEALTH_PORT: "8099"
+      BUZZ_METRICS_PORT: "9199"
+      BUZZ_AUTO_MIGRATE: "true"
+    ports:
+      - "3099:3099"
+      - "8099:8099"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8099/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
