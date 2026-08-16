@@ -34,7 +34,7 @@ base64         = { workspace = true }
 futures-util   = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url            = { workspace = true }
+tempfile       = "3"
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
-tempfile = "3"
