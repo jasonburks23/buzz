@@ -41,10 +41,13 @@
 //! NEVER log or assert on raw secret-key bytes or plaintext DM content.
 
 use buzz_seat_clerk::{
+    config::ClerkConfig,
+    discovery::fetch_own_read_state,
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
     read_state::{
-        build_read_state_plaintext, now_secs, record_youyou_read, ReadStateWriter, SlotIdentity,
+        build_read_state_plaintext, now_secs, parse_read_state_contexts, record_youyou_read,
+        ReadStateWriter, SlotIdentity,
     },
     session_identity::SessionMarker,
     wake::WakeEmitter,
@@ -417,4 +420,117 @@ async fn read_state_content_format_accepted_by_relay() {
         ok.message
     );
     let _ = conn.disconnect().await;
+}
+
+// --------------------------------------------------------------------------
+// Test 5: read-state survives a clerk restart (Fix 3 live verification)
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn read_state_survives_restart_via_relay_load() {
+    // Restart-survival proof for Fix 3 (read-state load-on-boot).
+    //
+    // Timeline:
+    //   1. A seat advances its read bookmark for a context to `advanced_ts` and
+    //      publishes the kind-30078 read-state to the relay.
+    //   2. The writer is dropped -- the in-memory read position is gone, exactly
+    //      as it would be after the clerk process exits.
+    //   3. A FRESH writer (same on-disk slot identity, empty in-memory state)
+    //      runs the production boot path: fetch_own_read_state -> nip44 decrypt
+    //      -> parse_read_state_contexts -> seed_contexts.
+    //   4. The restored read position equals `advanced_ts`: the bookmark
+    //      survived the restart, so reconnect subscriptions resume from the read
+    //      point instead of re-backfilling (and re-waking on) already-seen mail.
+    //
+    // SECURITY: never log ciphertext, plaintext, or the per-context timestamp.
+
+    let seat_keys = ephemeral_keys();
+    let seat_pubkey_hex = seat_keys.public_key().to_hex();
+
+    // On-disk slot identity persists across the simulated restart, mirroring the
+    // clerk's identity file (SlotIdentity::load_or_create on the same path).
+    let dir = tempdir().unwrap();
+    let id_path = dir.path().join("id.json");
+
+    let ctx = Uuid::new_v4().to_string();
+    let advanced_ts = now_secs();
+
+    // --- Pre-restart: advance the bookmark and publish it to the relay. ---
+    {
+        let id = SlotIdentity::load_or_create(&id_path).unwrap();
+        let mut writer = ReadStateWriter::new(id);
+        let live = SessionMarker::new("it-restart-live".to_string());
+        record_youyou_read(&mut writer, ctx.clone(), advanced_ts, &live, &live)
+            .expect("live marker must advance bookmark");
+
+        let mut conn = NostrWsConnection::connect_authenticated(&relay_url(), &seat_keys, None)
+            .await
+            .expect("connect to publish read-state");
+        let event = writer
+            .build_event(now_secs(), &seat_keys)
+            .expect("build read-state event");
+        let ok = conn.send_event(event).await.expect("send read-state");
+        assert!(ok.accepted, "relay must accept read-state: {}", ok.message);
+        let _ = conn.disconnect().await;
+    }
+    // `writer` is dropped: the in-memory bookmark is gone, like a process exit.
+
+    // --- Restart: fresh writer runs the production boot-load path. ---
+    let cfg = ClerkConfig {
+        keys: seat_keys.clone(),
+        public_key_hex: seat_pubkey_hex.clone(),
+        relay_url: relay_url(),
+        wake_file: dir.path().join("ignored.wake").display().to_string(),
+        seat_role: None,
+        seat_cwd: None,
+        readack_file: dir.path().join("ignored.readack").display().to_string(),
+        claim_dir: dir.path().display().to_string(),
+    };
+    let relay_http_url = relay_url().replacen("ws://", "http://", 1);
+    let http = reqwest::Client::new();
+
+    let id2 = SlotIdentity::load_or_create(&id_path).unwrap();
+    let mut writer2 = ReadStateWriter::new(id2);
+
+    // Fresh writer starts with no bookmark for the context.
+    assert_eq!(
+        writer2.read_at_for(&ctx),
+        None,
+        "a fresh writer must start with no read position before boot-load"
+    );
+
+    // The relay indexes the replaceable kind-30078 event asynchronously; poll a
+    // few times so the test is not racy on a slow relay.
+    let mut loaded = None;
+    for _ in 0..10 {
+        loaded = fetch_own_read_state(
+            &http,
+            &relay_http_url,
+            &seat_pubkey_hex,
+            &writer2.identity.slot_id,
+            &cfg,
+        )
+        .await
+        .expect("fetch_own_read_state must not error");
+        if loaded.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let (ciphertext, created_at) =
+        loaded.expect("relay must return the read-state we just published");
+    let plaintext =
+        nostr::nips::nip44::decrypt(cfg.keys.secret_key(), &cfg.keys.public_key(), &ciphertext)
+            .expect("decrypt own read-state");
+    let contexts = parse_read_state_contexts(&plaintext);
+    writer2.seed_contexts(contexts, created_at);
+
+    // After boot-load the bookmark is restored to its pre-restart value.
+    assert_eq!(
+        writer2.read_at_for(&ctx),
+        Some(advanced_ts),
+        "read position must survive restart: the restored bookmark must equal the pre-restart advance"
+    );
 }
