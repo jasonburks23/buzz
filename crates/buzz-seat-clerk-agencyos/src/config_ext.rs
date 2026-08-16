@@ -47,14 +47,11 @@ impl AgencyOsConfig {
     }
 }
 
-/// Generate a simple session id without adding a UUID crate dependency.
-/// Uses PID + subsecond nanos. Unique enough for a single-process clerk.
+/// Generate a collision-proof session id using UUID v4.
+///
+/// UUID v4 draws from the OS CSPRNG, so two fast same-PID restarts in the
+/// same nanosecond cannot collide. The "clerk-" prefix makes log lines easy
+/// to grep.
 fn generate_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(42);
-    let pid = std::process::id();
-    format!("clerk-{pid}-{nanos:08x}")
+    format!("clerk-{}", uuid::Uuid::new_v4())
 }

@@ -78,7 +78,7 @@ impl ClaimFileIdentity {
     /// `SessionMarker` for the file with the highest `ts` value. Unreadable
     /// or malformed files are silently skipped. Returns `None` if no valid
     /// matching claim is found.
-    pub fn resolve_live_marker_from_claims(&self) -> Option<SessionMarker> {
+    pub(crate) fn resolve_live_marker_from_claims(&self) -> Option<SessionMarker> {
         let dir = &self.claim_dir;
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -127,8 +127,12 @@ impl ClaimFileIdentity {
             }
 
             // Filter by cwd if configured.
+            // SECURITY: honest-seen is a security gate. A claim whose cwd does
+            // not exactly match a seat's configured cwd must be rejected,
+            // including an empty cwd. This prevents a stale or malformed claim
+            // from matching every seat that shares a role.
             if let Some(ref expected_cwd) = self.cwd {
-                if !claim.cwd.is_empty() && claim.cwd != *expected_cwd {
+                if claim.cwd != *expected_cwd {
                     debug!(
                         "claim_identity: skipping {:?} (cwd {:?} != {:?})",
                         path, claim.cwd, expected_cwd
@@ -373,6 +377,29 @@ mod tests {
         let local = id.local_marker().expect("local should be Some");
         let live = id.live_marker().expect("live should resolve");
         assert_eq!(local, live, "when this IS the live session, local == live");
+    }
+
+    #[test]
+    fn live_marker_empty_cwd_claim_rejected_when_filter_set() {
+        // When the identity has a non-empty cwd filter, a claim file whose cwd
+        // field is "" must be rejected. An empty cwd is not a wildcard; it is a
+        // malformed or stale claim and the honest-seen gate must not let it pass.
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path();
+
+        // Write a claim with an empty cwd string, matching role.
+        write_claim(tmp, "sid-empty-cwd", "TestRole", "", "2026-08-16T00:00:00Z");
+
+        let id = ClaimFileIdentity::new(
+            "any-session",
+            Some("TestRole".into()),
+            Some("/expected/cwd".into()),
+            tmp,
+        );
+        assert!(
+            id.live_marker().is_none(),
+            "empty-cwd claim must be rejected when cwd filter is set"
+        );
     }
 
     #[test]
