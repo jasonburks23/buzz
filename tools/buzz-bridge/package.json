@@ -1,0 +1,14 @@
+{
+  "name": "buzz-bridge",
+  "version": "2.0.0",
+  "description": "Claude Code Layer 2 wake bridge for the Buzz seat-listener",
+  "type": "module",
+  "main": "buzz-bridge.ts",
+  "scripts": {
+    "start": "bun run buzz-bridge.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

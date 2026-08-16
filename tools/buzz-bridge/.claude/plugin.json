@@ -1,0 +1,27 @@
+{
+  "name": "buzz-bridge",
+  "version": "2.0.0",
+  "description": "Buzz seat-listener wake bridge: wakes an idle Claude Code session when Buzz for-me mail arrives. Requires bun and a running buzz-seat-clerk.",
+  "author": "Civilization Agency",
+  "license": "MIT",
+  "mcpServers": {
+    "buzz-bridge": {
+      "command": "bun",
+      "args": ["{{pluginDir}}/buzz-bridge.ts"],
+      "env": {
+        "BUZZ_CLERK_DIR": "{{env.HOME}}/.buzz-clerk"
+      }
+    }
+  },
+  "requirements": {
+    "runtime": "bun >= 1.0.0",
+    "experimental_channels": true
+  },
+  "notes": [
+    "The claude/channel MCP capability used by this plugin is experimental.",
+    "Claude Code must be launched with --experimental-channels (or equivalent flag).",
+    "This flag may change in future Claude Code versions.",
+    "The plugin is content-free: it never reads message bodies or holds keys.",
+    "Template variables (pluginDir, env.HOME) may not be supported in all Claude Code versions. Use install.sh for a reliable one-step install."
+  ]
+}
