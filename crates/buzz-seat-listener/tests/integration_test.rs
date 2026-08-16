@@ -1,4 +1,5 @@
 //! Live integration tests for buzz-seat-listener.
+#![allow(deprecated)] // emit_if_lane_1 kept for backward compat; test exercises the legacy path.
 //!
 //! These tests require a running Buzz relay on port 3099. They are gated
 //! with `#[ignore]` so `cargo test -p buzz-seat-listener` stays green without

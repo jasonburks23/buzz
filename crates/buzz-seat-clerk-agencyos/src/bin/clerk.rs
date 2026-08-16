@@ -393,7 +393,9 @@ fn deliver_event(
     mailbox.insert(channel_uuid, entry);
 
     let lane = classify(is_dm, &p_tags, public_key_hex);
-    if let Err(e) = emitter.emit_if_lane_1(&lane, created_at_secs) {
+    if let Err(e) =
+        emitter.emit_if_lane_1_for_channel(&lane, &channel_uuid.to_string(), created_at_secs)
+    {
         warn!("wake emit failed: {e}");
     }
 
