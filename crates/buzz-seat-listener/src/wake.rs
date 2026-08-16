@@ -11,11 +11,16 @@ use std::fs;
 use crate::error::ClerkError;
 use crate::lane::Lane;
 
+/// Writes a wake signal to a file when a Lane-1 (ForMe) message arrives.
+///
+/// Create one instance per listener process and call `emit_if_lane_1` on
+/// each delivered message. The file path is set at construction time.
 pub struct WakeEmitter {
     wake_file_path: String,
 }
 
 impl WakeEmitter {
+    /// Create a new WakeEmitter that writes signals to `wake_file_path`.
     pub fn new(wake_file_path: String) -> Self {
         Self { wake_file_path }
     }

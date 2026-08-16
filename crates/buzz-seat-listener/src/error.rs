@@ -2,6 +2,9 @@
 
 use thiserror::Error;
 
+/// Top-level error type for the seat listener.
+///
+/// Covers configuration, network, cryptography, serialization, and IO failures.
 #[derive(Debug, Error)]
 pub enum ClerkError {
     #[error("missing environment variable: {0}")]

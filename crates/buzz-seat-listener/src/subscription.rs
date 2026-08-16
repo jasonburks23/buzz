@@ -63,6 +63,8 @@ pub struct TwoGenDedup {
 }
 
 impl TwoGenDedup {
+    /// Create a new TwoGenDedup. `capacity` is the number of IDs the new generation
+    /// holds before it displaces the old one. A value of 1000 suits most relay traffic.
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,

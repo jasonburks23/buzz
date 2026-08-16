@@ -33,7 +33,9 @@ const MAX_SLOTS: usize = 8;
 /// Replaces desktop's localStorage.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlotIdentity {
+    /// 32 lowercase hex characters (16 random bytes). Used as the `d` tag suffix.
     pub slot_id: String,
+    /// Arbitrary client identifier included in the read-state content blob.
     pub client_id: String,
 }
 
@@ -113,6 +115,10 @@ pub struct ReadStateWriter {
 }
 
 impl ReadStateWriter {
+    /// Create a new ReadStateWriter with a fresh in-memory state.
+    ///
+    /// Call `seed_contexts` after construction to pre-load bookmarks
+    /// recovered from a previously stored relay event.
     pub fn new(identity: SlotIdentity) -> Self {
         Self {
             identity,
@@ -272,7 +278,9 @@ pub fn record_youyou_read(
     Ok(())
 }
 
-/// Current wall-clock seconds.
+/// Return the current wall-clock time as Unix seconds.
+///
+/// Returns 0 if the system clock is before the Unix epoch (should not happen in practice).
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

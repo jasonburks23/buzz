@@ -60,7 +60,9 @@ pub enum SessionIdentityError {
 /// The kind of turn event (read or send).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
+    /// The session read incoming messages.
     Read,
+    /// The session sent an outgoing message.
     Send,
 }
 

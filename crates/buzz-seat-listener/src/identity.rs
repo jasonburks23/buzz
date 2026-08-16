@@ -4,7 +4,7 @@
 //! "who is the live session right now." The generic implementation,
 //! [`EnvIdentity`], trusts the reader: local == live, so the honest-seen
 //! gate in [`crate::read_state::record_youyou_read`] always passes.
-//! The fleet adapter supplies [`ClaimFileIdentity`] (in buzz-seat-clerk-agencyos)
+//! The fleet adapter supplies `ClaimFileIdentity` (in buzz-seat-clerk-agencyos)
 //! which resolves liveness from `/tmp/claude-seat-claim-*.json` files.
 
 use crate::session_identity::SessionMarker;
