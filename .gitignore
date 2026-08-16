@@ -70,5 +70,9 @@ identity.key
 # mesh-llm build cache
 .cache/
 
-# Helm dependency tarballs — regenerable from Chart.lock via `helm dependency build`
+# Helm dependency tarballs - regenerable from Chart.lock via `helm dependency build`
 deploy/charts/*/charts/*.tgz
+
+# Buzz clerk per-seat secret env files. These contain SEAT_NSEC (Nostr private key).
+# NEVER commit these files. Created by the operator manually after running generate-clerk-plists.mjs.
+.env.seat.*
