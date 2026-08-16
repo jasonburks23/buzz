@@ -111,6 +111,11 @@ pub fn merge_channel_info(uuids: Vec<Uuid>, meta_events: &Value) -> HashMap<Uuid
         let mut d_uuid: Option<Uuid> = None;
         let mut name = String::new();
         let mut channel_type = ChannelType::Unknown;
+        // The live relay encodes channel type as a topic tag `["t","dm"]` /
+        // `["t","stream"]`, not a `channel_type` tag. Capture it here and resolve
+        // after the loop so an explicit `channel_type` tag (if a relay ever sends
+        // one) still wins, but a `t` marker is honored when it is all we get.
+        let mut t_type = ChannelType::Unknown;
         let mut archived = false;
         for tag in tags {
             let Some(a) = tag.as_array() else { continue };
@@ -130,11 +135,24 @@ pub fn merge_channel_info(uuids: Vec<Uuid>, meta_events: &Value) -> HashMap<Uuid
                         _ => ChannelType::Unknown,
                     };
                 }
+                Some("t") => {
+                    if let Some(v) = a.get(1).and_then(|v| v.as_str()) {
+                        match v {
+                            "dm" => t_type = ChannelType::Dm,
+                            "stream" => t_type = ChannelType::Stream,
+                            _ => {}
+                        }
+                    }
+                }
                 Some("archived") => {
                     archived = a.get(1).and_then(|v| v.as_str()) == Some("true");
                 }
                 _ => {}
             }
+        }
+        // Fall back to the `t` topic marker when no explicit channel_type tag set it.
+        if channel_type == ChannelType::Unknown {
+            channel_type = t_type;
         }
         if archived {
             continue;
@@ -285,6 +303,33 @@ mod tests {
         let uuid_str = Uuid::new_v4().to_string();
         let uuid = uuid_str.parse::<Uuid>().unwrap();
         let meta_events = serde_json::json!([make_meta_event(&uuid_str, "dm-room", "dm")]);
+        let map = merge_channel_info(vec![uuid], &meta_events);
+        assert_eq!(map[&uuid].channel_type, ChannelType::Dm);
+    }
+
+    #[test]
+    fn build_channel_info_dm_from_relay_t_tag() {
+        // The live relay marks a DM with ["t","dm"] (plus bare "private"/"closed"
+        // markers and name "DM"), NOT a ["channel_type","dm"] tag. Discovery must
+        // recognize this real shape as a DM, or every DM classifies as a plain
+        // channel and only @mentions wake the seat.
+        let uuid_str = Uuid::new_v4().to_string();
+        let uuid = uuid_str.parse::<Uuid>().unwrap();
+        let meta_events = serde_json::json!([{
+            "kind": 39000,
+            "tags": [
+                ["d", uuid_str],
+                ["name", "DM"],
+                ["private"],
+                ["hidden"],
+                ["p", "2f0e192ac3cd7028f6e898b52714cb688f86d6fbc04ac6d34228fb26f6e1ef3b"],
+                ["p", "7575874aad5870d8a534ac924766ad6f3613ce845f223d85e4f3691413a05b79"],
+                ["closed"],
+                ["t", "dm"]
+            ],
+            "content": "",
+            "created_at": 1000
+        }]);
         let map = merge_channel_info(vec![uuid], &meta_events);
         assert_eq!(map[&uuid].channel_type, ChannelType::Dm);
     }
