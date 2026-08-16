@@ -362,6 +362,10 @@ mod tests {
             public_key_hex: String::new(),
             relay_url: String::new(),
             wake_file: String::new(),
+            seat_role: None,
+            seat_cwd: None,
+            readack_file: String::new(),
+            claim_dir: String::new(),
         };
 
         // Use a concrete body matching the member-filter shape (no raw-string tricks needed).

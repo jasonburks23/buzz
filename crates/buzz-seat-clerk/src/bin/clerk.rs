@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use buzz_core::kind::{
@@ -23,7 +23,9 @@ use buzz_seat_clerk::{
     discovery::{discover_channels, ChannelInfo, ChannelType},
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
-    read_state::{now_secs, ReadStateWriter, SlotIdentity},
+    read_ack::parse_read_ack,
+    read_state::{now_secs, record_youyou_read, ReadGuardError, ReadStateWriter, SlotIdentity},
+    session_identity::{resolve_live_marker_from_claims, SessionMarker},
     subscription::{channel_req_frame, membership_req_frame, TwoGenDedup},
     wake::WakeEmitter,
 };
@@ -43,6 +45,28 @@ async fn main() -> Result<()> {
     let cfg = ClerkConfig::from_env().context("load config")?;
     info!(pubkey = %cfg.public_key_hex, relay = %cfg.relay_url, "clerk starting");
 
+    // Resolve live session identity from fleet seat-claim files.
+    // Feature is only active when SEAT_ROLE is set.
+    let live_marker: Option<SessionMarker> = if let Some(ref role) = cfg.seat_role {
+        match resolve_live_marker_from_claims(
+            Path::new(&cfg.claim_dir),
+            role,
+            cfg.seat_cwd.as_deref(),
+        ) {
+            Ok(marker) => {
+                info!(role = %role, "live identity resolved");
+                Some(marker)
+            }
+            Err(e) => {
+                warn!("honest-seen disabled: could not resolve live identity: {e}");
+                None
+            }
+        }
+    } else {
+        info!("honest-seen disabled: no SEAT_ROLE configured");
+        None
+    };
+
     let identity_path = std::env::var("IDENTITY_FILE")
         .unwrap_or_else(|_| "/tmp/buzz-seat-clerk-identity.json".into());
     let identity =
@@ -53,6 +77,7 @@ async fn main() -> Result<()> {
     let mut mailbox = Mailbox::new();
     let emitter = WakeEmitter::new(cfg.wake_file.clone());
     let mut dedup = TwoGenDedup::new(512);
+    let mut last_readack_mtime: Option<SystemTime> = None;
 
     // Derive relay HTTP URL from WS URL.
     let relay_http_url = cfg
@@ -106,6 +131,48 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => warn!("read-state build failed: {e}"),
+                }
+            }
+
+            // Poll the read-ack file for honest read-receipt advancement.
+            // Only active when live_marker is Some (SEAT_ROLE is configured).
+            if let Some(ref live) = live_marker {
+                let readack_path = Path::new(&cfg.readack_file);
+                let current_mtime = std::fs::metadata(readack_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                let changed = match (current_mtime, last_readack_mtime) {
+                    (Some(cur), Some(prev)) => cur != prev,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if changed {
+                    last_readack_mtime = current_mtime;
+                    if let Ok(raw) = std::fs::read_to_string(readack_path) {
+                        if let Some(ack) = parse_read_ack(&raw) {
+                            match record_youyou_read(
+                                &mut writer,
+                                ack.channel.clone(),
+                                ack.up_to_ts,
+                                &SessionMarker::new(ack.marker.clone()),
+                                live,
+                            ) {
+                                Ok(()) => {
+                                    debug!(
+                                        channel = %ack.channel,
+                                        ts = ack.up_to_ts,
+                                        "read-ack advanced bookmark"
+                                    );
+                                }
+                                Err(ReadGuardError::NotLiveSession) => {
+                                    warn!(
+                                        channel = %ack.channel,
+                                        "read-ack from non-live actor ignored"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
