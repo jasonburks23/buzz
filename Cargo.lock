@@ -1368,7 +1368,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "buzz-seat-clerk"
+name = "buzz-seat-listener"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1376,6 +1376,7 @@ dependencies = [
  "buzz-core",
  "buzz-sdk",
  "buzz-ws-client",
+ "futures-util",
  "hex",
  "nostr 0.44.7",
  "rand 0.10.1",
@@ -1386,8 +1387,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
