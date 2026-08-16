@@ -15,10 +15,14 @@ use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::config::ClerkConfig;
+use crate::config::ListenerConfig;
 use crate::error::ClerkError;
 use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_READ_STATE};
 
+// BORROW-OPPORTUNITY(SP-2): make_nip98_post_token duplicates
+// nostr::nips::nip98::HttpData token generation. When nostr 0.44 exposes
+// a stable public API for this, replace this function with the upstream
+// helper and delete this copy. Track in refactor-282 SP-2.
 /// Build a NIP-98 HTTP Auth token (kind-27235) for a POST request.
 ///
 /// Tag set mirrors crates/buzz-cli/src/client.rs `sign_nip98`:
@@ -26,7 +30,11 @@ use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_
 ///
 /// The body bytes are hashed here so the hash matches the bytes actually sent.
 /// Never logs the signing key, the token, or message content.
-fn make_nip98_post_token(cfg: &ClerkConfig, url: &str, body: &[u8]) -> Result<String, ClerkError> {
+fn make_nip98_post_token(
+    cfg: &ListenerConfig,
+    url: &str,
+    body: &[u8],
+) -> Result<String, ClerkError> {
     let payload_hash = hex::encode(Sha256::digest(body));
     let nonce = uuid::Uuid::new_v4().to_string();
     let tags = vec![
@@ -184,7 +192,7 @@ pub async fn fetch_own_read_state(
     relay_http_url: &str,
     seat_pubkey_hex: &str,
     slot_id: &str,
-    cfg: &ClerkConfig,
+    cfg: &ListenerConfig,
 ) -> Result<Option<(String, u64)>, ClerkError> {
     let d_tag_value = format!("read-state:{slot_id}");
     let filter = serde_json::json!({
@@ -223,6 +231,10 @@ pub async fn fetch_own_read_state(
     Ok(best)
 }
 
+// BORROW-OPPORTUNITY(future): discover_channels logic is duplicated in at
+// least 3 locations across the codebase. Largest single borrow opportunity.
+// Needs an upstream PR to extract into a shared buzz-sdk crate. Keep our
+// copy until that PR lands.
 /// Perform the full two-step REST discovery against the Buzz relay HTTP bridge.
 ///
 /// * `relay_http_url` - HTTP base URL of the relay (e.g. `http://localhost:3000`).
@@ -236,7 +248,7 @@ pub async fn discover_channels(
     http: &Client,
     relay_http_url: &str,
     seat_pubkey_hex: &str,
-    cfg: &ClerkConfig,
+    cfg: &ListenerConfig,
 ) -> Result<HashMap<Uuid, ChannelInfo>, ClerkError> {
     // Step 1: kind:39002 where #p = seat_pubkey
     // Filter shape mirrors buzz-cli's cmd_list_channels member path (channels.rs):
@@ -407,15 +419,12 @@ mod tests {
         let keys =
             nostr::Keys::parse("0000000000000000000000000000000000000000000000000000000000000001")
                 .expect("valid test key");
-        let cfg = crate::config::ClerkConfig {
+        let cfg = crate::config::ListenerConfig {
             keys,
             public_key_hex: String::new(),
             relay_url: String::new(),
             wake_file: String::new(),
-            seat_role: None,
-            seat_cwd: None,
             readack_file: String::new(),
-            claim_dir: String::new(),
         };
 
         // Use a concrete body matching the member-filter shape (no raw-string tricks needed).

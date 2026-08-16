@@ -41,7 +41,7 @@
 //! NEVER log or assert on raw secret-key bytes or plaintext DM content.
 
 use buzz_seat_listener::{
-    config::ClerkConfig,
+    config::ListenerConfig,
     discovery::fetch_own_read_state,
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
@@ -477,15 +477,12 @@ async fn read_state_survives_restart_via_relay_load() {
     // `writer` is dropped: the in-memory bookmark is gone, like a process exit.
 
     // --- Restart: fresh writer runs the production boot-load path. ---
-    let cfg = ClerkConfig {
+    let cfg = ListenerConfig {
         keys: seat_keys.clone(),
         public_key_hex: seat_pubkey_hex.clone(),
         relay_url: relay_url(),
         wake_file: dir.path().join("ignored.wake").display().to_string(),
-        seat_role: None,
-        seat_cwd: None,
         readack_file: dir.path().join("ignored.readack").display().to_string(),
-        claim_dir: dir.path().display().to_string(),
     };
     let relay_http_url = relay_url().replacen("ws://", "http://", 1);
     let http = reqwest::Client::new();

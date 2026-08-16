@@ -1,77 +1,71 @@
-//! Clerk configuration loaded from environment variables.
+//! Configuration for the generic seat listener.
 //!
-//! `SEAT_NSEC`: bech32 nsec of the seat identity key.
-//! `RELAY_URL`: WebSocket URL of the Buzz relay (e.g. `ws://localhost:3000`).
-//! `WAKE_FILE` (optional): path to write the wake signal. Defaults to `/tmp/buzz-seat-clerk.wake`.
+//! Reads only env vars that are meaningful to any Buzz seat listener.
+//! Fleet-specific vars (SEAT_ROLE, SEAT_CWD, CLAIM_DIR) are intentionally
+//! absent; the fleet adapter reads them in its own config extension.
 
 use nostr::{FromBech32, Keys, SecretKey};
 
 use crate::error::ClerkError;
 
-/// Runtime configuration for one clerk instance.
+/// Configuration loaded from environment variables for the generic listener.
+///
+/// Does not contain fleet identity fields. Use `AgencyOsConfig` (in
+/// buzz-seat-clerk-agencyos) for fleet-specific extension.
 ///
 /// Deliberately does NOT derive `Debug` -- hand-written impl redacts the secret key.
-pub struct ClerkConfig {
+pub struct ListenerConfig {
+    /// The nostr signing keys for this seat.
     pub keys: Keys,
+    /// Hex-encoded public key derived from `keys`.
     pub public_key_hex: String,
+    /// WebSocket relay URL (e.g. "wss://relay.example.com").
     pub relay_url: String,
+    /// Path to the wake file. When this file is touched, the listener wakes.
     pub wake_file: String,
-    /// Fleet seat role (e.g. `"AgencyOS-CC-Alpha"`).  When `Some`, the honest
-    /// read-receipt feature is active.  When `None`, the feature is disabled.
-    pub seat_role: Option<String>,
-    /// Optional seat working directory for claim-file disambiguation.
-    pub seat_cwd: Option<String>,
-    /// Path to the read-ack file written by the live session.
+    /// Path to the read-ack file. The listener writes read acknowledgements here.
     pub readack_file: String,
-    /// Directory containing `claude-seat-claim-*.json` fleet files.
-    pub claim_dir: String,
 }
 
-impl std::fmt::Debug for ClerkConfig {
+impl std::fmt::Debug for ListenerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClerkConfig")
+        f.debug_struct("ListenerConfig")
             .field("public_key_hex", &self.public_key_hex)
             .field("relay_url", &self.relay_url)
             .field("wake_file", &self.wake_file)
-            .field("seat_role", &self.seat_role)
-            .field("seat_cwd", &self.seat_cwd)
             .field("readack_file", &self.readack_file)
-            .field("claim_dir", &self.claim_dir)
             .field("keys", &"<REDACTED>")
             .finish()
     }
 }
 
-impl ClerkConfig {
+impl ListenerConfig {
     /// Load configuration from environment variables.
+    ///
+    /// Required vars: `SEAT_NSEC`, `RELAY_URL`.
+    /// Optional vars: `WAKE_FILE` (default: `/tmp/buzz-seat-listener.wake`),
+    ///                `READACK_FILE` (default: `/tmp/buzz-seat-listener.readack`).
     pub fn from_env() -> Result<Self, ClerkError> {
         let nsec_str =
             std::env::var("SEAT_NSEC").map_err(|_| ClerkError::MissingEnv("SEAT_NSEC".into()))?;
         let relay_url =
             std::env::var("RELAY_URL").map_err(|_| ClerkError::MissingEnv("RELAY_URL".into()))?;
         let wake_file =
-            std::env::var("WAKE_FILE").unwrap_or_else(|_| "/tmp/buzz-seat-clerk.wake".into());
+            std::env::var("WAKE_FILE").unwrap_or_else(|_| "/tmp/buzz-seat-listener.wake".into());
+        let readack_file = std::env::var("READACK_FILE")
+            .unwrap_or_else(|_| "/tmp/buzz-seat-listener.readack".into());
 
         let secret_key =
             SecretKey::from_bech32(&nsec_str).map_err(|e| ClerkError::InvalidKey(e.to_string()))?;
         let keys = Keys::new(secret_key);
         let public_key_hex = keys.public_key().to_hex();
 
-        let seat_role = std::env::var("SEAT_ROLE").ok();
-        let seat_cwd = std::env::var("SEAT_CWD").ok();
-        let readack_file =
-            std::env::var("READACK_FILE").unwrap_or_else(|_| "/tmp/buzz-seat-clerk.readack".into());
-        let claim_dir = std::env::var("CLAIM_DIR").unwrap_or_else(|_| "/tmp".into());
-
         Ok(Self {
             keys,
             public_key_hex,
             relay_url,
             wake_file,
-            seat_role,
-            seat_cwd,
             readack_file,
-            claim_dir,
         })
     }
 }
@@ -94,7 +88,9 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SEAT_NSEC", TEST_NSEC);
         std::env::set_var("RELAY_URL", "ws://localhost:3000");
-        let cfg = ClerkConfig::from_env().unwrap();
+        std::env::remove_var("WAKE_FILE");
+        std::env::remove_var("READACK_FILE");
+        let cfg = ListenerConfig::from_env().unwrap();
         assert_eq!(cfg.relay_url, "ws://localhost:3000");
         // pubkey is derived; just check it is non-empty
         assert!(!cfg.public_key_hex.is_empty());
@@ -105,7 +101,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SEAT_NSEC", TEST_NSEC);
         std::env::set_var("RELAY_URL", "ws://localhost:3000");
-        let cfg = ClerkConfig::from_env().unwrap();
+        let cfg = ListenerConfig::from_env().unwrap();
         let debug = format!("{cfg:?}");
         assert!(
             !debug.contains("nsec1"),
@@ -122,7 +118,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SEAT_NSEC");
         std::env::set_var("RELAY_URL", "ws://localhost:3000");
-        assert!(ClerkConfig::from_env().is_err());
+        assert!(ListenerConfig::from_env().is_err());
     }
 
     #[test]
@@ -130,24 +126,20 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SEAT_NSEC", TEST_NSEC);
         std::env::remove_var("RELAY_URL");
-        assert!(ClerkConfig::from_env().is_err());
+        assert!(ListenerConfig::from_env().is_err());
     }
 
     #[test]
-    fn config_with_seat_role_set_populates_fields() {
+    fn config_without_fleet_vars_has_generic_defaults() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SEAT_NSEC", TEST_NSEC);
         std::env::set_var("RELAY_URL", "ws://localhost:3000");
-        std::env::set_var("SEAT_ROLE", "AgencyOS-CC-Alpha");
-        std::env::set_var("SEAT_CWD", "/some/cwd");
-        std::env::set_var("READACK_FILE", "/tmp/custom.readack");
-        std::env::set_var("CLAIM_DIR", "/custom/claims");
+        std::env::remove_var("WAKE_FILE");
+        std::env::remove_var("READACK_FILE");
 
-        let cfg = ClerkConfig::from_env().unwrap();
-        assert_eq!(cfg.seat_role.as_deref(), Some("AgencyOS-CC-Alpha"));
-        assert_eq!(cfg.seat_cwd.as_deref(), Some("/some/cwd"));
-        assert_eq!(cfg.readack_file, "/tmp/custom.readack");
-        assert_eq!(cfg.claim_dir, "/custom/claims");
+        let cfg = ListenerConfig::from_env().unwrap();
+        assert_eq!(cfg.wake_file, "/tmp/buzz-seat-listener.wake");
+        assert_eq!(cfg.readack_file, "/tmp/buzz-seat-listener.readack");
 
         // Debug must still redact keys, must NOT contain nsec literal.
         let debug = format!("{cfg:?}");
@@ -155,34 +147,5 @@ mod tests {
             !debug.contains("nsec1"),
             "nsec must not appear in Debug output"
         );
-
-        // Clean up.
-        std::env::remove_var("SEAT_ROLE");
-        std::env::remove_var("SEAT_CWD");
-        std::env::remove_var("READACK_FILE");
-        std::env::remove_var("CLAIM_DIR");
-    }
-
-    #[test]
-    fn config_without_seat_role_has_none_and_defaults() {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("SEAT_NSEC", TEST_NSEC);
-        std::env::set_var("RELAY_URL", "ws://localhost:3000");
-        std::env::remove_var("SEAT_ROLE");
-        std::env::remove_var("SEAT_CWD");
-        std::env::remove_var("READACK_FILE");
-        std::env::remove_var("CLAIM_DIR");
-
-        let cfg = ClerkConfig::from_env().unwrap();
-        assert!(
-            cfg.seat_role.is_none(),
-            "seat_role must be None when SEAT_ROLE unset"
-        );
-        assert!(
-            cfg.seat_cwd.is_none(),
-            "seat_cwd must be None when SEAT_CWD unset"
-        );
-        assert_eq!(cfg.readack_file, "/tmp/buzz-seat-clerk.readack");
-        assert_eq!(cfg.claim_dir, "/tmp");
     }
 }

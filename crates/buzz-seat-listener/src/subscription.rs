@@ -47,6 +47,9 @@ pub fn channel_req_frame(sub_id: &str, channel_uuid: &Uuid, since: u64) -> Value
     ])
 }
 
+// BORROW-OPPORTUNITY(future): TwoGenDedup duplicates a private struct in
+// buzz-acp. Cannot borrow yet (no public upstream export). Keep this copy
+// until buzz-acp exposes it as a library type.
 /// Two-generation in-memory dedup for event IDs.
 ///
 /// Mirrors the buzz-acp pattern (relay.rs:966). Keeps two generations of seen

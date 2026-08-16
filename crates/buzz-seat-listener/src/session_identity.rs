@@ -1,34 +1,32 @@
-//! Session-identity marker for live-seat guard tests.
+//! Generic session identity types.
 //!
-//! Every Buzz read and send must carry the live session's marker so downstream
-//! guard checks can prove the actor is the continuous live session and not a
-//! freshly spawned process.
-//!
-//! The marker IS the Claude Code `session_id`: a UUID that is stable across
-//! the session's turns and compaction, and different for any fresh spawn.
-//! It is read once at boot from a sidecar file written by the host harness.
+//! Contains only data types that are meaningful outside any fleet context.
+//! IO functions (load_live_marker, resolve_live_marker_from_claims) and
+//! fleet-specific structs (SidecarFile, SeatClaimFile) live in
+//! buzz-seat-clerk-agencyos::claim_identity.
 
-use std::path::Path;
-
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // ─── Marker ──────────────────────────────────────────────────────────────────
 
-/// Newtype over the Claude Code session_id string.
+/// Opaque marker that identifies one running clerk session.
+///
+/// Wraps a string (typically a UUID or a role-stamped slug). Two markers
+/// are equal when their inner strings are equal.
 ///
 /// `Debug` shows only a fixed label so log output stays tidy.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionMarker(pub(crate) String);
 
 impl SessionMarker {
-    /// Construct a marker from a session-id string.
+    /// Create a new SessionMarker from any string.
     ///
     /// Exposed `pub` so integration tests (external crate) can build markers
-    /// for use with `record_youyou_read`. Application code should use
-    /// `load_live_marker` instead.
-    pub fn new(id: String) -> Self {
-        Self(id)
+    /// for use with `record_youyou_read`. Fleet code should use
+    /// `ClaimFileIdentity` (in buzz-seat-clerk-agencyos) to resolve the live marker.
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
 }
 
@@ -46,169 +44,21 @@ impl std::fmt::Display for SessionMarker {
 
 // ─── Error ───────────────────────────────────────────────────────────────────
 
-/// Errors that can occur while loading the session marker from the sidecar.
+/// Errors that can occur when working with session identity types.
 #[derive(Debug, Error)]
 pub enum SessionIdentityError {
-    /// The sidecar file does not exist at the expected path.
-    #[error("sidecar file not found: {path}")]
-    SidecarMissing { path: String },
-
-    /// The sidecar file exists but could not be read.
-    #[error("sidecar unreadable: {source}")]
-    SidecarUnreadable { source: std::io::Error },
-
-    /// The sidecar JSON was read but does not contain the expected fields.
-    #[error("malformed sidecar JSON: {reason}")]
-    MalformedSidecar { reason: String },
-
-    /// The session_id field in the sidecar is empty or whitespace-only.
-    ///
-    /// An empty marker would allow two unrelated fakes to match each other,
-    /// which defeats the live-seat guard entirely.
-    #[error("sidecar session_id is empty or whitespace-only")]
-    EmptySessionId,
-
-    /// No seat-claim file matched the given role (and optional cwd).
-    ///
-    /// Either the claim directory is empty, no file has the expected name
-    /// prefix, or all matching files had non-matching role/cwd fields.
-    #[error("no live seat claim found for role={role}")]
-    NoLiveClaim { role: String },
-}
-
-// ─── Sidecar shape ───────────────────────────────────────────────────────────
-
-/// JSON shape of the sidecar file written by the Claude Code harness.
-#[derive(Deserialize)]
-struct SidecarFile {
-    session_id: String,
-}
-
-// ─── Seat-claim shape ────────────────────────────────────────────────────────
-
-/// JSON shape of the fleet seat-claim files at `/tmp/claude-seat-claim-<sid>.json`.
-#[derive(Deserialize)]
-struct SeatClaimFile {
-    session_id: String,
-    role: String,
-    #[serde(default)]
-    cwd: String,
-    /// RFC3339 UTC timestamp string; lexicographic max picks the freshest.
-    ts: String,
-}
-
-// ─── Loader ──────────────────────────────────────────────────────────────────
-
-/// Read the live session marker from the sidecar file.
-///
-/// The sidecar path is `<sidecar_dir>/claude-seat-id-<session_id>.json`.
-/// `sidecar_dir` is injectable so tests never touch real `/tmp`.
-pub fn load_live_marker(
-    sidecar_dir: &Path,
-    session_id: &str,
-) -> Result<SessionMarker, SessionIdentityError> {
-    let path = sidecar_dir.join(format!("claude-seat-id-{session_id}.json"));
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            SessionIdentityError::SidecarMissing {
-                path: path.display().to_string(),
-            }
-        } else {
-            SessionIdentityError::SidecarUnreadable { source: e }
-        }
-    })?;
-    let parsed: SidecarFile =
-        serde_json::from_str(&raw).map_err(|e| SessionIdentityError::MalformedSidecar {
-            reason: e.to_string(),
-        })?;
-    if parsed.session_id.trim().is_empty() {
-        return Err(SessionIdentityError::EmptySessionId);
-    }
-    Ok(SessionMarker(parsed.session_id))
-}
-
-// ─── Fleet-claim resolver ─────────────────────────────────────────────────────
-
-/// Resolve the live session marker from the fleet seat-claim files.
-///
-/// Scans `claim_dir` for files whose names start with `claude-seat-claim-` and
-/// end with `.json`.  For each such file, parses the JSON and keeps entries
-/// where `role` matches and (if `cwd` is `Some`) `cwd` matches.  Among all
-/// kept entries, picks the one with the lexicographically-greatest `ts` string
-/// (RFC3339 UTC sorts correctly as plain strings) whose `session_id` is
-/// non-empty after trimming.
-///
-/// Unreadable or malformed files are silently skipped so one bad file does not
-/// break the whole scan.
-///
-/// Returns [`SessionIdentityError::NoLiveClaim`] if no matching claim is found.
-pub fn resolve_live_marker_from_claims(
-    claim_dir: &Path,
-    role: &str,
-    cwd: Option<&str>,
-) -> Result<SessionMarker, SessionIdentityError> {
-    let entries = match std::fs::read_dir(claim_dir) {
-        Ok(e) => e,
-        Err(_) => {
-            return Err(SessionIdentityError::NoLiveClaim {
-                role: role.to_string(),
-            });
-        }
-    };
-
-    let mut best: Option<(String, String)> = None; // (ts, session_id)
-
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.starts_with("claude-seat-claim-") || !name_str.ends_with(".json") {
-            continue;
-        }
-
-        let raw = match std::fs::read_to_string(entry.path()) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        let claim: SeatClaimFile = match serde_json::from_str(&raw) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        if claim.role != role {
-            continue;
-        }
-        if let Some(expected_cwd) = cwd {
-            if claim.cwd != expected_cwd {
-                continue;
-            }
-        }
-        let sid = claim.session_id.trim().to_string();
-        if sid.is_empty() {
-            continue;
-        }
-
-        let better = match &best {
-            None => true,
-            Some((best_ts, _)) => claim.ts > *best_ts,
-        };
-        if better {
-            best = Some((claim.ts, sid));
-        }
-    }
-
-    match best {
-        Some((_, sid)) => Ok(SessionMarker::new(sid)),
-        None => Err(SessionIdentityError::NoLiveClaim {
-            role: role.to_string(),
-        }),
-    }
+    /// A required file could not be read.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A file's JSON content could not be parsed.
+    #[error("json parse error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 // ─── Event record ────────────────────────────────────────────────────────────
 
 /// The kind of turn event (read or send).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Read,
     Send,
@@ -218,7 +68,7 @@ pub enum EventKind {
 ///
 /// `marker` is `None` when the event originated from a fresh spawn that had
 /// no access to the live sidecar.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEvent {
     pub kind: EventKind,
     pub marker: Option<SessionMarker>,
@@ -244,7 +94,6 @@ impl TurnEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn live() -> SessionMarker {
         SessionMarker("live-session-uuid-1234".to_string())
@@ -298,193 +147,5 @@ mod tests {
         let markers: Vec<&SessionMarker> =
             events.iter().filter_map(|e| e.marker.as_ref()).collect();
         assert!(markers.windows(2).all(|w| w[0] == w[1]));
-    }
-
-    // Loader test: write a temp sidecar and verify the loader returns the correct marker.
-    #[test]
-    fn loader_reads_marker_from_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        let session_id = "test-sid";
-        let sidecar_path = tmp.join(format!("claude-seat-id-{session_id}.json"));
-        let mut f = std::fs::File::create(&sidecar_path).unwrap();
-        writeln!(
-            f,
-            r#"{{"session_id":"{session_id}","ghostty_id":"g1","cwd":"/tmp","role_marker":"agencyos-cc"}}"#
-        )
-        .unwrap();
-
-        let result = load_live_marker(tmp, session_id);
-        assert!(result.is_ok(), "loader failed: {:?}", result);
-        assert_eq!(result.unwrap(), SessionMarker(session_id.to_string()));
-    }
-
-    // Loader test: missing file returns SidecarMissing.
-    #[test]
-    fn loader_returns_missing_error_for_absent_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-        // Do NOT create the sidecar file.
-        let result = load_live_marker(tmp, "nonexistent-sid");
-        assert!(
-            matches!(result, Err(SessionIdentityError::SidecarMissing { .. })),
-            "expected SidecarMissing, got {:?}",
-            result
-        );
-    }
-
-    // Loader test: empty or whitespace-only session_id returns EmptySessionId.
-    #[test]
-    fn loader_rejects_empty_session_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        // Write a sidecar with session_id = "".
-        let empty_sidecar = tmp.join("claude-seat-id-.json");
-        std::fs::write(&empty_sidecar, r#"{"session_id":""}"#).unwrap();
-        let result = load_live_marker(tmp, "");
-        assert!(
-            matches!(result, Err(SessionIdentityError::EmptySessionId)),
-            "expected EmptySessionId for empty string, got {:?}",
-            result
-        );
-
-        // Write a sidecar with session_id = "   " (whitespace only).
-        let ws_sidecar = tmp.join("claude-seat-id-   .json");
-        std::fs::write(&ws_sidecar, r#"{"session_id":"   "}"#).unwrap();
-        let result = load_live_marker(tmp, "   ");
-        assert!(
-            matches!(result, Err(SessionIdentityError::EmptySessionId)),
-            "expected EmptySessionId for whitespace-only string, got {:?}",
-            result
-        );
-    }
-
-    // Loader test: malformed JSON in sidecar returns MalformedSidecar.
-    #[test]
-    fn loader_rejects_malformed_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        let session_id = "test-malformed";
-        let sidecar_path = tmp.join(format!("claude-seat-id-{session_id}.json"));
-        std::fs::write(&sidecar_path, "not json {").unwrap();
-
-        let result = load_live_marker(tmp, session_id);
-        assert!(
-            matches!(result, Err(SessionIdentityError::MalformedSidecar { .. })),
-            "expected MalformedSidecar, got {:?}",
-            result
-        );
-    }
-
-    // ── resolve_live_marker_from_claims tests ──────────────────────────────
-
-    fn write_claim(dir: &std::path::Path, session_id: &str, role: &str, cwd: &str, ts: &str) {
-        let filename = format!("claude-seat-claim-{session_id}.json");
-        let content = serde_json::json!({
-            "session_id": session_id,
-            "role": role,
-            "cwd": cwd,
-            "ts": ts,
-        })
-        .to_string();
-        std::fs::write(dir.join(filename), content).unwrap();
-    }
-
-    #[test]
-    fn claims_freshest_ts_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        write_claim(
-            tmp,
-            "sid-old",
-            "MyRole",
-            "/some/cwd",
-            "2026-08-01T00:00:00Z",
-        );
-        write_claim(
-            tmp,
-            "sid-new",
-            "MyRole",
-            "/some/cwd",
-            "2026-08-14T00:55:55Z",
-        );
-
-        let marker = resolve_live_marker_from_claims(tmp, "MyRole", None).unwrap();
-        assert_eq!(marker, SessionMarker::new("sid-new".to_string()));
-    }
-
-    #[test]
-    fn claims_role_filter_excludes_non_matching() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        write_claim(tmp, "sid-a", "WrongRole", "/cwd", "2026-08-14T00:00:00Z");
-
-        let result = resolve_live_marker_from_claims(tmp, "MyRole", None);
-        assert!(
-            matches!(result, Err(SessionIdentityError::NoLiveClaim { .. })),
-            "expected NoLiveClaim when no matching role, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn claims_cwd_disambiguation() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        write_claim(
-            tmp,
-            "sid-alpha",
-            "SharedRole",
-            "/cwd/alpha",
-            "2026-08-14T01:00:00Z",
-        );
-        write_claim(
-            tmp,
-            "sid-beta",
-            "SharedRole",
-            "/cwd/beta",
-            "2026-08-14T02:00:00Z",
-        );
-
-        // With cwd filter for alpha, should get sid-alpha even though sid-beta has newer ts.
-        let marker =
-            resolve_live_marker_from_claims(tmp, "SharedRole", Some("/cwd/alpha")).unwrap();
-        assert_eq!(marker, SessionMarker::new("sid-alpha".to_string()));
-
-        // Without cwd filter, should get sid-beta (newest ts).
-        let marker = resolve_live_marker_from_claims(tmp, "SharedRole", None).unwrap();
-        assert_eq!(marker, SessionMarker::new("sid-beta".to_string()));
-    }
-
-    #[test]
-    fn claims_empty_dir_returns_no_live_claim() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = resolve_live_marker_from_claims(dir.path(), "AnyRole", None);
-        assert!(
-            matches!(result, Err(SessionIdentityError::NoLiveClaim { .. })),
-            "expected NoLiveClaim for empty dir, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn claims_malformed_file_skipped_valid_resolves() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path();
-
-        // Write one malformed file.
-        std::fs::write(tmp.join("claude-seat-claim-bad.json"), "not valid json {{{").unwrap();
-
-        // Write one valid file.
-        write_claim(tmp, "sid-good", "GoodRole", "/cwd", "2026-08-14T00:00:00Z");
-
-        let marker = resolve_live_marker_from_claims(tmp, "GoodRole", None).unwrap();
-        assert_eq!(marker, SessionMarker::new("sid-good".to_string()));
     }
 }

@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
-//! # buzz-seat-clerk
+//! # buzz-seat-listener
 //!
-//! Headless, always-on, dumb delivery clerk for one Buzz seat.
+//! Headless, always-on, generic Buzz seat listener library.
 //!
 //! ## What it does
 //!
@@ -12,8 +12,9 @@
 //!
 //! ## What it does NOT do
 //!
-//! It never answers. It never injects keystrokes. It is a delivery clerk, not
-//! a brain.
+//! It never answers. It never injects keystrokes. It is a delivery listener, not
+//! a brain. It has no knowledge of fleet identity, claim files, or AgencyOS.
+//! Fleet-specific wiring lives in `buzz-seat-clerk-agencyos`.
 //!
 //! ## Attention lanes
 //!
@@ -32,8 +33,8 @@
 //!
 //! `SEAT_NSEC` (required): bech32 nsec of the seat identity key.
 //! `RELAY_URL` (required): WebSocket URL of the Buzz relay.
-//! `WAKE_FILE` (optional): path for the wake signal file. Default: `/tmp/buzz-seat-clerk.wake`.
-//! `IDENTITY_FILE` (optional): path for the slot identity JSON. Default: `/tmp/buzz-seat-clerk-identity.json`.
+//! `WAKE_FILE` (optional): path for the wake signal file. Default: `/tmp/buzz-seat-listener.wake`.
+//! `READACK_FILE` (optional): path for the read-ack JSON. Default: `/tmp/buzz-seat-listener.readack`.
 
 pub mod badge;
 pub mod config;
