@@ -93,4 +93,109 @@ mod tests {
             "live_marker should be None when constructed with None"
         );
     }
+
+    // ── SP-1 Acceptance: gate-integration via injected SeatIdentity ───────────
+
+    /// ACCEPTANCE (trusting path): EnvIdentity local == live, so record_youyou_read
+    /// must return Ok(()) and advance the bookmark.
+    ///
+    /// This is non-vacuous: we assert the bookmark moves from None to Some(ts)
+    /// confirming the gate did not refuse.
+    #[test]
+    fn env_identity_gate_passes_and_advances_bookmark() {
+        use crate::read_state::{record_youyou_read, ReadStateWriter, SlotIdentity};
+
+        let marker = make_marker("session-env-001");
+        let identity = EnvIdentity::new(Some(marker));
+
+        let local = identity
+            .local_marker()
+            .expect("EnvIdentity must return Some");
+        let live = identity
+            .live_marker()
+            .expect("EnvIdentity must return Some");
+
+        // Sanity: they must be equal for this test to be meaningful.
+        assert_eq!(
+            local.0, live.0,
+            "EnvIdentity must produce equal local and live markers"
+        );
+
+        let slot = SlotIdentity {
+            slot_id: crate::read_state::generate_slot_id(),
+            client_id: crate::read_state::generate_slot_id(),
+        };
+        let mut writer = ReadStateWriter::new(slot);
+
+        let ctx = "chan-env-gate-test".to_string();
+        let ts = 1_700_000_000u64;
+
+        // Before: bookmark is absent.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            None,
+            "bookmark must be None before gate call"
+        );
+
+        let result = record_youyou_read(&mut writer, ctx.clone(), ts, &local, &live);
+
+        assert!(
+            result.is_ok(),
+            "EnvIdentity gate must pass (Ok); got: {:?}",
+            result
+        );
+
+        // After: bookmark advanced to ts -- proving the gate passed, not just returned Ok.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            Some(ts),
+            "bookmark must advance to {ts} when gate passes"
+        );
+    }
+
+    /// ACCEPTANCE (honest-seen, non-trusting): when markers differ, gate refuses
+    /// and bookmark stays at None.
+    ///
+    /// This test does NOT use a SeatIdentity impl -- it directly exercises the
+    /// record_youyou_read gate with a mismatched pair to prove the gate logic
+    /// is the single refusal point. The ClaimFileIdentity integration test
+    /// (tests/honest_seen.rs in buzz-seat-clerk-agencyos) confirms the same gate
+    /// fires through the fleet adapter.
+    #[test]
+    fn mismatched_markers_gate_refuses_and_bookmark_stays_none() {
+        use crate::read_state::{
+            record_youyou_read, ReadGuardError, ReadStateWriter, SlotIdentity,
+        };
+
+        let slot = SlotIdentity {
+            slot_id: crate::read_state::generate_slot_id(),
+            client_id: crate::read_state::generate_slot_id(),
+        };
+        let mut writer = ReadStateWriter::new(slot);
+
+        let live_marker = make_marker("live-session-xyz");
+        let imposter_marker = make_marker("imposter-session-abc");
+        let ctx = "chan-refusal-test".to_string();
+
+        let result = record_youyou_read(
+            &mut writer,
+            ctx.clone(),
+            9_999_999_999u64,
+            &imposter_marker,
+            &live_marker,
+        );
+
+        assert_eq!(
+            result,
+            Err(ReadGuardError::NotLiveSession),
+            "mismatched markers must return Err(NotLiveSession)"
+        );
+
+        // Non-vacuous: confirm the bookmark did NOT move.
+        assert_eq!(
+            writer.read_at_for(&ctx),
+            None,
+            "bookmark must remain None when gate refuses"
+        );
+    }
 }
