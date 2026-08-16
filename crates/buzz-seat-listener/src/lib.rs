@@ -40,6 +40,7 @@ pub mod config;
 pub mod connection;
 pub mod discovery;
 pub mod error;
+pub mod identity;
 pub mod lane;
 pub mod mailbox;
 pub mod read_ack;
