@@ -1,7 +1,7 @@
-//! Live integration tests for buzz-seat-clerk.
+//! Live integration tests for buzz-seat-listener.
 //!
 //! These tests require a running Buzz relay on port 3099. They are gated
-//! with `#[ignore]` so `cargo test -p buzz-seat-clerk` stays green without
+//! with `#[ignore]` so `cargo test -p buzz-seat-listener` stays green without
 //! any infrastructure.
 //!
 //! # How to run
@@ -11,8 +11,8 @@
 //!
 //!    ```sh
 //!    docker compose \
-//!      -f crates/buzz-seat-clerk/support/relay-compose-test.yml \
-//!      -p buzz-clerk-it \
+//!      -f crates/buzz-seat-listener/support/relay-compose-test.yml \
+//!      -p buzz-listener-it \
 //!      up -d
 //!    ```
 //!
@@ -29,7 +29,7 @@
 //!    TEST_RELAY_URL=ws://localhost:3099 \
 //!    SEAT_NSEC=<a fresh nsec> \
 //!    RELAY_URL=ws://localhost:3099 \
-//!      cargo test -p buzz-seat-clerk -- --ignored
+//!      cargo test -p buzz-seat-listener -- --ignored
 //!    ```
 //!
 //! # Safety contract
@@ -40,7 +40,7 @@
 //!
 //! NEVER log or assert on raw secret-key bytes or plaintext DM content.
 
-use buzz_seat_clerk::{
+use buzz_seat_listener::{
     config::ClerkConfig,
     discovery::fetch_own_read_state,
     lane::{classify, Lane},
@@ -285,7 +285,7 @@ async fn lane_1_message_delivered_and_wake_written() {
     // This mirrors what clerk.rs main loop does for each received event.
     // -----------------------------------------------------------------------
     let dir = tempdir().unwrap();
-    let wake_path = dir.path().join("buzz-seat-clerk.wake");
+    let wake_path = dir.path().join("buzz-seat-listener.wake");
     let emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
     let mut mailbox = Mailbox::new();
 
