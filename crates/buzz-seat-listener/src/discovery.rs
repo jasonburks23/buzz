@@ -8,10 +8,12 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
-use nostr::{EventBuilder, JsonUtil, Kind, Tag};
+use nostr::hashes::sha256::Hash as Sha256Hash;
+use nostr::hashes::Hash as _;
+use nostr::nips::nip98::{HttpData, HttpMethod};
+use nostr::{EventBuilder, JsonUtil, Kind, Tag, Url};
 use reqwest::Client;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -19,37 +21,37 @@ use crate::config::ListenerConfig;
 use crate::error::ClerkError;
 use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_READ_STATE};
 
-// BORROW-OPPORTUNITY(SP-2): make_nip98_post_token duplicates
-// nostr::nips::nip98::HttpData token generation. When nostr 0.44 exposes
-// a stable public API for this, replace this function with the upstream
-// helper and delete this copy. Track in refactor-282 SP-2.
 /// Build a NIP-98 HTTP Auth token (kind-27235) for a POST request.
 ///
-/// Tag set mirrors crates/buzz-cli/src/client.rs `sign_nip98`:
-///   ["u", url], ["method", "POST"], ["nonce", uuid-v4], ["payload", hex(sha256(body))]
+/// Delegates tag construction to `nostr::nips::nip98::HttpData`.
+/// A nonce tag is added for relay parity (mirrors buzz-acp sign_nip98 behavior).
 ///
-/// The body bytes are hashed here so the hash matches the bytes actually sent.
 /// Never logs the signing key, the token, or message content.
 fn make_nip98_post_token(
     cfg: &ListenerConfig,
     url: &str,
     body: &[u8],
 ) -> Result<String, ClerkError> {
-    let payload_hash = hex::encode(Sha256::digest(body));
+    let parsed_url =
+        Url::parse(url).map_err(|e| ClerkError::Discovery(format!("parse url for NIP-98: {e}")))?;
+    let payload_hash = Sha256Hash::hash(body);
     let nonce = uuid::Uuid::new_v4().to_string();
-    let tags = vec![
-        Tag::parse(["u", url]).map_err(|e| ClerkError::Discovery(format!("build u tag: {e}")))?,
-        Tag::parse(["method", "POST"])
-            .map_err(|e| ClerkError::Discovery(format!("build method tag: {e}")))?,
+
+    let http_data = HttpData::new(parsed_url, HttpMethod::POST).payload(payload_hash);
+
+    // Convert HttpData into its tag vec (url, method, payload).
+    // Then inject the nonce tag for relay parity before signing.
+    let mut tags: Vec<Tag> = http_data.into();
+    tags.push(
         Tag::parse(["nonce", &nonce])
             .map_err(|e| ClerkError::Discovery(format!("build nonce tag: {e}")))?,
-        Tag::parse(["payload", &payload_hash])
-            .map_err(|e| ClerkError::Discovery(format!("build payload tag: {e}")))?,
-    ];
-    let event = EventBuilder::new(Kind::Custom(27235), "")
+    );
+
+    let event = EventBuilder::new(Kind::HttpAuth, "")
         .tags(tags)
         .sign_with_keys(&cfg.keys)
         .map_err(|e| ClerkError::Discovery(format!("NIP-98 signing failed: {e}")))?;
+
     let json = event.as_json();
     Ok(format!(
         "Nostr {}",
@@ -470,7 +472,7 @@ mod tests {
         );
 
         // "payload" tag must be present and its value must equal hex(sha256(body)).
-        let expected_hash = hex::encode(Sha256::digest(body));
+        let expected_hash = format!("{}", Sha256Hash::hash(body));
         let payload_tag = tags
             .iter()
             .find(|t| t.first().map(String::as_str) == Some("payload"))
