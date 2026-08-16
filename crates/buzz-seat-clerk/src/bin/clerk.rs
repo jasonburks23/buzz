@@ -27,6 +27,7 @@ use buzz_seat_clerk::{
     subscription::{channel_req_frame, membership_req_frame, TwoGenDedup},
     wake::WakeEmitter,
 };
+use buzz_ws_client::error::WsClientError;
 use buzz_ws_client::message::RelayMessage;
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
@@ -177,8 +178,12 @@ async fn main() -> Result<()> {
                 }
                 Ok(_) => {} // EOSE, NOTICE, etc. -- ignore.
                 Err(e) => {
-                    error!("relay error: {e}; reconnecting");
-                    break 'event_loop;
+                    if should_reconnect(&e) {
+                        error!("relay error: {e}; reconnecting");
+                        break 'event_loop;
+                    }
+                    debug!("relay idle ({e}); continuing");
+                    continue;
                 }
             }
         }
@@ -204,6 +209,13 @@ fn extract_h_tag(event: &nostr::Event) -> Option<Uuid> {
 // and 44101) but the event loop only needs to act on 44100 (add).
 // KIND_MEMBER_REMOVED_NOTIFICATION handling (unsubscribe) is future work.
 const _: u32 = KIND_MEMBER_REMOVED_NOTIFICATION;
+
+/// A read timeout means the relay was simply idle for the window; that is
+/// normal and must NOT trigger a reconnect. Every other error is a real
+/// transport fault and should reconnect.
+fn should_reconnect(err: &WsClientError) -> bool {
+    !matches!(err, WsClientError::Timeout)
+}
 
 /// Returns true when the event author is the seat itself.
 ///
@@ -367,5 +379,24 @@ mod tests {
             None,
             "delivery must NOT advance the read bookmark (US-07 hard line)"
         );
+    }
+
+    // RED tests for should_reconnect (written before the helper exists).
+    // These will fail to compile until should_reconnect is implemented.
+    #[test]
+    fn should_reconnect_false_on_timeout() {
+        assert!(!should_reconnect(&WsClientError::Timeout));
+    }
+
+    #[test]
+    fn should_reconnect_true_on_connection_closed() {
+        assert!(should_reconnect(&WsClientError::ConnectionClosed));
+    }
+
+    #[test]
+    fn should_reconnect_true_on_transport_error() {
+        // ConnectionClosed is a second distinct non-timeout variant; confirm
+        // should_reconnect returns true for any non-Timeout error.
+        assert!(should_reconnect(&WsClientError::ConnectionClosed));
     }
 }
