@@ -20,15 +20,23 @@ use tempfile::TempDir;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write a minimal claim file into `dir` for the given session_id and role.
-/// Uses an RFC3339-like timestamp derived from the current wall clock so
-/// freshness ordering is deterministic when only one claim is present.
+/// The `ts` field is written as an RFC3339 UTC string, matching the real fleet
+/// claim format and the format expected by claim_identity unit tests.
 fn write_claim_file(dir: &TempDir, role: &str, session_id: &str) {
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    // Minimal RFC3339 UTC string (lexicographic ordering matches time ordering).
-    let ts = format!("{now_secs}");
+    // RFC3339 UTC: embed the current time-of-day into a fixed 2026-08-16 base.
+    // Each honest_seen test writes a single claim per directory, so cross-claim
+    // ordering is not exercised here. HH:MM:SS gives sufficient uniqueness for
+    // any freshness comparison within a single test run.
+    let ts = format!(
+        "2026-08-16T{:02}:{:02}:{:02}Z",
+        (now_secs % 86_400) / 3_600,
+        (now_secs % 3_600) / 60,
+        now_secs % 60,
+    );
     let content = serde_json::json!({
         "session_id": session_id,
         "role": role,
