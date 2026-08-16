@@ -1,0 +1,26 @@
+[package]
+name = "buzz-seat-clerk-agencyos"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "AgencyOS fleet adapter for buzz-seat-listener. Injects ClaimFileIdentity for honest-seen session gating."
+
+[lib]
+name = "buzz_seat_clerk_agencyos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clerk"
+path = "src/bin/clerk.rs"
+
+[dependencies]
+buzz-seat-listener = { path = "../buzz-seat-listener" }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

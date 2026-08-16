@@ -32,6 +32,7 @@ members = [
     "crates/buzz-datastore-tracing",
     "examples/countdown-bot",
     "crates/buzz-seat-listener",
+    "crates/buzz-seat-clerk-agencyos",
 ]
 exclude = ["desktop/src-tauri"]
 resolver = "2"
