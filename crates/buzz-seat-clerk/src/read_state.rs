@@ -76,11 +76,36 @@ pub fn build_read_state_plaintext(
     Ok(serde_json::to_string(&blob)?)
 }
 
+/// Parse a read-state plaintext blob and return the `contexts` map.
+///
+/// Format: `{"v":1,"client_id":"<str>","contexts":{"<ctx>":<unix_secs>,...}}`
+///
+/// On malformed JSON, missing `contexts`, or any other error returns an empty map.
+/// Non-numeric `ts` values are silently skipped.
+///
+/// SECURITY: do NOT log the returned map -- it contains per-context timestamps.
+pub fn parse_read_state_contexts(plaintext: &str) -> HashMap<String, u64> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(plaintext) else {
+        return HashMap::new();
+    };
+    let Some(contexts_val) = value.get("contexts") else {
+        return HashMap::new();
+    };
+    let Some(obj) = contexts_val.as_object() else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter_map(|(k, v)| v.as_u64().map(|ts| (k.clone(), ts)))
+        .collect()
+}
+
 /// Stateful writer for kind-30078 read-state events.
 pub struct ReadStateWriter {
     pub identity: SlotIdentity,
     /// Max created_at successfully sent for this slot (monotonic watermark).
     last_written_created_at: u64,
+    /// Durable confirmed read positions (survives flush).
+    contexts: HashMap<String, u64>,
     /// Pending context updates not yet flushed.
     pending_contexts: HashMap<String, u64>,
     /// Wall-clock of the last flush (for 5-second debounce).
@@ -92,6 +117,7 @@ impl ReadStateWriter {
         Self {
             identity,
             last_written_created_at: 0,
+            contexts: HashMap::new(),
             pending_contexts: HashMap::new(),
             last_flush_wall: 0,
         }
@@ -99,9 +125,34 @@ impl ReadStateWriter {
 
     /// Record a context as read. `ctx` is a channel UUID, `"thread:<hex>"`, or `"msg:<hex>"`.
     pub(crate) fn mark_read(&mut self, ctx: String, ts: u64) {
-        let entry = self.pending_contexts.entry(ctx).or_insert(0);
+        // Update pending_contexts (max).
+        let entry = self.pending_contexts.entry(ctx.clone()).or_insert(0);
         if ts > *entry {
             *entry = ts;
+        }
+        // Also update durable contexts (max).
+        let durable = self.contexts.entry(ctx).or_insert(0);
+        if ts > *durable {
+            *durable = ts;
+        }
+    }
+
+    /// Seed durable contexts from a previously-stored read-state event (boot-time load).
+    ///
+    /// Merges `loaded` into `self.contexts` taking the per-key max, and advances
+    /// `last_written_created_at` to prevent the next publish from being silently
+    /// rejected by the relay watermark.
+    ///
+    /// SECURITY: do NOT log `loaded` values -- they contain per-context timestamps.
+    pub fn seed_contexts(&mut self, loaded: HashMap<String, u64>, loaded_created_at: u64) {
+        for (ctx, ts) in loaded {
+            let entry = self.contexts.entry(ctx).or_insert(0);
+            if ts > *entry {
+                *entry = ts;
+            }
+        }
+        if loaded_created_at > self.last_written_created_at {
+            self.last_written_created_at = loaded_created_at;
         }
     }
 
@@ -123,10 +174,19 @@ impl ReadStateWriter {
 
     /// Returns the last-read unix seconds for a context key, or None if absent.
     ///
+    /// Returns the max of the durable `contexts` map and the pending `pending_contexts` map.
     /// Used by the reconnect path to set `since` on per-room subscriptions, so
     /// the relay only backfills messages the seat has not yet read.
     pub fn read_at_for(&self, ctx: &str) -> Option<u64> {
-        self.pending_contexts.get(ctx).copied()
+        match (
+            self.contexts.get(ctx).copied(),
+            self.pending_contexts.get(ctx).copied(),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
     /// Build a signed kind-30078 event from pending contexts.
@@ -224,6 +284,7 @@ pub fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use nostr::Keys;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     fn test_keys() -> Keys {
@@ -465,6 +526,119 @@ mod tests {
         // A higher timestamp advances it.
         writer.mark_read(ctx.clone(), ts + 60);
         assert_eq!(writer.read_at_for(&ctx), Some(ts + 60));
+    }
+
+    // ── Piece A: durable positions map ──────────────────────────────────────
+
+    /// REGRESSION: after mark_read + build_event, read_at_for must still return the ts.
+    /// Today this FAILS because build_event clears pending_contexts and read_at_for
+    /// only reads pending_contexts.
+    #[test]
+    fn piece_a_regression_read_at_for_survives_flush() {
+        let mut writer = test_writer();
+        let keys = Keys::generate();
+        writer.mark_read("ch".to_string(), 100);
+        // flush
+        let _ = writer.build_event(1_700_000_000, &keys).unwrap();
+        // bookmark must still be 100
+        assert_eq!(
+            writer.read_at_for("ch"),
+            Some(100),
+            "read_at_for must return Some(100) after flush (durable contexts map)"
+        );
+    }
+
+    /// seed_contexts loads contexts and watermark correctly.
+    #[test]
+    fn piece_a_seed_contexts_loads_and_watermark() {
+        let mut writer = test_writer();
+        let mut loaded = HashMap::new();
+        loaded.insert("ch".to_string(), 500u64);
+        writer.seed_contexts(loaded, 12345);
+        assert_eq!(writer.read_at_for("ch"), Some(500));
+        // next_created_at(1) must be >= 12346
+        let at = writer.next_created_at(1);
+        assert!(
+            at >= 12346,
+            "next_created_at after seed must be >= 12346, got {at}"
+        );
+    }
+
+    /// mark_read after seed keeps the max of the two values.
+    #[test]
+    fn piece_a_mark_read_after_seed_keeps_max() {
+        let mut writer = test_writer();
+        let mut loaded = HashMap::new();
+        loaded.insert("ch".to_string(), 500u64);
+        writer.seed_contexts(loaded, 0);
+        // mark a lower ts -- should keep 500
+        writer.mark_read("ch".to_string(), 200);
+        assert_eq!(writer.read_at_for("ch"), Some(500));
+        // mark a higher ts -- should advance to 600
+        writer.mark_read("ch".to_string(), 600);
+        assert_eq!(writer.read_at_for("ch"), Some(600));
+    }
+
+    // ── Piece B: parse_read_state_contexts ──────────────────────────────────
+
+    /// Valid blob yields the expected contexts map.
+    #[test]
+    fn piece_b_valid_blob_yields_map() {
+        let blob =
+            r#"{"v":1,"client_id":"test","contexts":{"ch-abc":1700000000,"ch-xyz":1700000001}}"#;
+        let map = parse_read_state_contexts(blob);
+        assert_eq!(map.get("ch-abc"), Some(&1_700_000_000u64));
+        assert_eq!(map.get("ch-xyz"), Some(&1_700_000_001u64));
+    }
+
+    /// Malformed JSON returns empty map.
+    #[test]
+    fn piece_b_malformed_json_returns_empty() {
+        let map = parse_read_state_contexts("not json at all {{");
+        assert!(map.is_empty(), "malformed JSON must yield empty map");
+    }
+
+    /// Missing contexts key returns empty map.
+    #[test]
+    fn piece_b_missing_contexts_returns_empty() {
+        let blob = r#"{"v":1,"client_id":"test"}"#;
+        let map = parse_read_state_contexts(blob);
+        assert!(map.is_empty(), "missing contexts key must yield empty map");
+    }
+
+    /// Non-numeric ts entry is skipped; numeric entries survive.
+    #[test]
+    fn piece_b_non_numeric_ts_skipped() {
+        let blob =
+            r#"{"v":1,"client_id":"test","contexts":{"good":1700000000,"bad":"not-a-number"}}"#;
+        let map = parse_read_state_contexts(blob);
+        assert_eq!(map.get("good"), Some(&1_700_000_000u64));
+        assert!(!map.contains_key("bad"), "non-numeric ts must be skipped");
+    }
+
+    // ── Piece C (unit): NIP-44 round-trip decrypt+parse ─────────────────────
+
+    /// Build plaintext, encrypt to self, decrypt, parse_read_state_contexts; contexts survive.
+    #[test]
+    fn piece_c_roundtrip_encrypt_parse() {
+        let keys = Keys::generate();
+        let mut contexts = HashMap::new();
+        contexts.insert("chan-001".to_string(), 1_720_000_001u64);
+        contexts.insert("chan-002".to_string(), 1_720_000_099u64);
+        let plaintext = build_read_state_plaintext("test-client", &contexts).unwrap();
+        let ciphertext = nostr::nips::nip44::encrypt(
+            keys.secret_key(),
+            &keys.public_key(),
+            &plaintext,
+            nostr::nips::nip44::Version::V2,
+        )
+        .expect("encrypt must succeed");
+        let decrypted =
+            nostr::nips::nip44::decrypt(keys.secret_key(), &keys.public_key(), &ciphertext)
+                .expect("decrypt must succeed");
+        let parsed = parse_read_state_contexts(&decrypted);
+        assert_eq!(parsed.get("chan-001"), Some(&1_720_000_001u64));
+        assert_eq!(parsed.get("chan-002"), Some(&1_720_000_099u64));
     }
 
     #[test]

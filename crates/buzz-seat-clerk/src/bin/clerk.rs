@@ -20,11 +20,14 @@ use buzz_core::kind::{
 use buzz_seat_clerk::{
     config::ClerkConfig,
     connection::connect_with_backoff,
-    discovery::{discover_channels, ChannelInfo, ChannelType},
+    discovery::{discover_channels, fetch_own_read_state, ChannelInfo, ChannelType},
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
     read_ack::parse_read_ack,
-    read_state::{now_secs, record_youyou_read, ReadGuardError, ReadStateWriter, SlotIdentity},
+    read_state::{
+        now_secs, parse_read_state_contexts, record_youyou_read, ReadGuardError, ReadStateWriter,
+        SlotIdentity,
+    },
     session_identity::{resolve_live_marker_from_claims, SessionMarker},
     subscription::{channel_req_frame, membership_req_frame, TwoGenDedup},
     wake::WakeEmitter,
@@ -85,6 +88,44 @@ async fn main() -> Result<()> {
         .replacen("ws://", "http://", 1)
         .replacen("wss://", "https://", 1);
     let http = Client::new();
+
+    // Boot-time read-state load: restore prior read positions so reconnect
+    // subscriptions start from the correct `since` rather than epoch 0.
+    // Non-fatal: a failure here only means the seat re-reads already-seen messages.
+    // SECURITY: never log ciphertext, plaintext, or per-context timestamps.
+    match fetch_own_read_state(
+        &http,
+        &relay_http_url,
+        &cfg.public_key_hex,
+        &writer.identity.slot_id,
+        &cfg,
+    )
+    .await
+    {
+        Ok(Some((ciphertext, created_at))) => {
+            match nostr::nips::nip44::decrypt(
+                cfg.keys.secret_key(),
+                &cfg.keys.public_key(),
+                &ciphertext,
+            ) {
+                Ok(plaintext) => {
+                    let contexts = parse_read_state_contexts(&plaintext);
+                    let n = contexts.len();
+                    writer.seed_contexts(contexts, created_at);
+                    info!("read-state loaded: {} context(s)", n);
+                }
+                Err(e) => {
+                    warn!("read-state load failed: {e}; starting from empty");
+                }
+            }
+        }
+        Ok(None) => {
+            info!("no prior read-state found");
+        }
+        Err(e) => {
+            warn!("read-state load failed: {e}; starting from empty");
+        }
+    }
 
     loop {
         // Connect (retries forever by default).

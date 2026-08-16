@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::config::ClerkConfig;
 use crate::error::ClerkError;
-use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA};
+use buzz_core::kind::{KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_READ_STATE};
 
 /// Build a NIP-98 HTTP Auth token (kind-27235) for a POST request.
 ///
@@ -171,6 +171,56 @@ pub fn merge_channel_info(uuids: Vec<Uuid>, meta_events: &Value) -> HashMap<Uuid
         }
     }
     map
+}
+
+/// Fetch the seat's own kind-30078 read-state event from the relay, if any.
+///
+/// Returns `Some((ciphertext, created_at))` for the event with the greatest `created_at`,
+/// or `None` if no matching event exists.
+///
+/// SECURITY: never log `ciphertext`, decrypted content, or secret-key material.
+pub async fn fetch_own_read_state(
+    http: &Client,
+    relay_http_url: &str,
+    seat_pubkey_hex: &str,
+    slot_id: &str,
+    cfg: &ClerkConfig,
+) -> Result<Option<(String, u64)>, ClerkError> {
+    let d_tag_value = format!("read-state:{slot_id}");
+    let filter = serde_json::json!({
+        "kinds": [KIND_READ_STATE as u64],
+        "authors": [seat_pubkey_hex],
+        "#d": [d_tag_value],
+    });
+    let body = serde_json::to_vec(&[&filter])?;
+    let query_url = format!("{relay_http_url}/query");
+    let token = make_nip98_post_token(cfg, &query_url, &body)?;
+    let response: Value = http
+        .post(&query_url)
+        .header("Authorization", token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ClerkError::Discovery(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| ClerkError::Discovery(e.to_string()))?;
+
+    let Some(arr) = response.as_array() else {
+        return Ok(None);
+    };
+    // Pick the event with the greatest created_at.
+    let best = arr
+        .iter()
+        .filter_map(|ev| {
+            let content = ev.get("content")?.as_str()?.to_string();
+            let created_at = ev.get("created_at")?.as_u64()?;
+            Some((content, created_at))
+        })
+        .max_by_key(|(_, ts)| *ts);
+
+    Ok(best)
 }
 
 /// Perform the full two-step REST discovery against the Buzz relay HTTP bridge.
