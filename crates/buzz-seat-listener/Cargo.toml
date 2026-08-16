@@ -1,17 +1,19 @@
 [package]
-name = "buzz-seat-clerk"
+name = "buzz-seat-listener"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Headless per-seat delivery clerk for Buzz: connects, subscribes, delivers, badges, bookmarks."
+description = "Generic Buzz seat listener library -- connection, discovery, mailbox, lane classification, read-state gating. Zero fleet assumptions."
+autobins = false
+autoexamples = false
 
 [lib]
-name = "buzz_seat_clerk"
+name = "buzz_seat_listener"
 path = "src/lib.rs"
 
-[[bin]]
-name = "clerk"
-path = "src/bin/clerk.rs"
+[[example]]
+name = "seat-listener"
+path = "examples/seat-listener.rs"
 
 [dependencies]
 buzz-core      = { path = "../../crates/buzz-core" }
@@ -31,6 +33,9 @@ rand           = { workspace = true }
 base64         = { workspace = true }
 sha2           = { workspace = true }
 hex            = { workspace = true }
+futures-util   = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url            = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

@@ -1368,6 +1368,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-seat-clerk-agencyos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buzz-core",
+ "buzz-seat-listener",
+ "buzz-ws-client",
+ "nostr 0.44.7",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-seat-listener"
 version = "0.1.0"
 dependencies = [
