@@ -164,7 +164,9 @@ async fn main() -> Result<()> {
                             channel_uuid,
                         );
 
-                        debug!(
+                        // info-level so a live test shows each message landing
+                        // (and its lane) at the default log level, without debug.
+                        info!(
                             channel = %channel_uuid,
                             lane = ?lane,
                             author = %event.pubkey.to_hex(),
