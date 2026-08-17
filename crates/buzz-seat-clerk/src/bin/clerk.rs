@@ -298,6 +298,19 @@ async fn main() -> Result<()> {
                             channel_uuid,
                         );
 
+                        // On a Lane-1 wake, also write the unread-summary sidecar.
+                        // This lets the woken session read one file and open exactly
+                        // the right rooms without sweeping every channel.
+                        if lane == Lane::ForMe {
+                            emitter.emit_badge_sidecar(
+                                event.created_at.as_secs(),
+                                &mailbox,
+                                &writer,
+                                &channels,
+                                &cfg.public_key_hex,
+                            );
+                        }
+
                         // info-level so a live test shows each message landing
                         // (and its lane) at the default log level, without debug.
                         info!(
