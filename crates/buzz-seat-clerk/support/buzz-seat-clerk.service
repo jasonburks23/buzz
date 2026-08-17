@@ -1,0 +1,16 @@
+[Unit]
+Description=Buzz Seat Clerk (headless delivery clerk for one Buzz seat)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/buzz-seat-clerk/env
+ExecStart=/usr/local/bin/clerk
+Restart=on-failure
+RestartSec=5s
+# Limit restarts to avoid a crash loop burning relay connection budget.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=default.target
