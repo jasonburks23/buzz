@@ -23,7 +23,7 @@ use buzz_seat_clerk::{
     discovery::{discover_channels, fetch_own_read_state, ChannelInfo, ChannelType},
     lane::{classify, Lane},
     mailbox::{Mailbox, MailboxEntry},
-    read_ack::parse_read_ack,
+    read_ack::{parse_multi_channel_ack, parse_read_ack},
     read_state::{
         now_secs, parse_read_state_contexts, record_youyou_read, ReadGuardError, ReadStateWriter,
         SlotIdentity,
@@ -190,7 +190,33 @@ async fn main() -> Result<()> {
                 if changed {
                     last_readack_mtime = current_mtime;
                     if let Ok(raw) = std::fs::read_to_string(readack_path) {
-                        if let Some(ack) = parse_read_ack(&raw) {
+                        // Try multi-channel format first (v1); fall back to single-channel.
+                        if let Some(multi_ack) = parse_multi_channel_ack(&raw) {
+                            let actor = SessionMarker::new(multi_ack.marker.clone());
+                            for (channel, ts) in &multi_ack.channels {
+                                match record_youyou_read(
+                                    &mut writer,
+                                    channel.clone(),
+                                    *ts,
+                                    &actor,
+                                    live,
+                                ) {
+                                    Ok(()) => {
+                                        debug!(
+                                            channel = %channel,
+                                            ts = ts,
+                                            "multi-channel read-ack advanced bookmark"
+                                        );
+                                    }
+                                    Err(ReadGuardError::NotLiveSession) => {
+                                        warn!(
+                                            channel = %channel,
+                                            "multi-channel read-ack from non-live actor ignored"
+                                        );
+                                    }
+                                }
+                            }
+                        } else if let Some(ack) = parse_read_ack(&raw) {
                             match record_youyou_read(
                                 &mut writer,
                                 ack.channel.clone(),
@@ -508,5 +534,73 @@ mod tests {
         // ConnectionClosed is a second distinct non-timeout variant; confirm
         // should_reconnect returns true for any non-Timeout error.
         assert!(should_reconnect(&WsClientError::ConnectionClosed));
+    }
+
+    // Task 2: multi-channel ack wiring tests.
+    // Written before the poll-loop implementation to drive TDD.
+
+    /// A multi-channel ack with the correct live marker advances ALL listed channels.
+    #[test]
+    fn multi_channel_ack_live_marker_advances_all_channels() {
+        use buzz_seat_clerk::read_ack::parse_multi_channel_ack;
+        use buzz_seat_clerk::read_state::{
+            generate_slot_id, record_youyou_read, ReadStateWriter, SlotIdentity,
+        };
+        use buzz_seat_clerk::session_identity::SessionMarker;
+
+        let live = SessionMarker::new("live-session-abc".to_string());
+        let mut writer = ReadStateWriter::new(SlotIdentity {
+            slot_id: generate_slot_id(),
+            client_id: generate_slot_id(),
+        });
+
+        let json =
+            r#"{"v":1,"channels":{"chan-one":1000,"chan-two":2000},"marker":"live-session-abc"}"#;
+        let ack = parse_multi_channel_ack(json).expect("must parse");
+        let actor = SessionMarker::new(ack.marker.clone());
+
+        // Advance each channel using the same code path the wired poll loop will use.
+        for (channel, ts) in &ack.channels {
+            record_youyou_read(&mut writer, channel.clone(), *ts, &actor, &live)
+                .expect("live actor must succeed");
+        }
+
+        // Both bookmarks must be advanced.
+        assert_eq!(writer.read_at_for("chan-one"), Some(1000));
+        assert_eq!(writer.read_at_for("chan-two"), Some(2000));
+    }
+
+    /// A multi-channel ack with a wrong marker must be refused for ALL channels.
+    #[test]
+    fn multi_channel_ack_wrong_marker_is_refused() {
+        use buzz_seat_clerk::read_ack::parse_multi_channel_ack;
+        use buzz_seat_clerk::read_state::{
+            generate_slot_id, record_youyou_read, ReadGuardError, ReadStateWriter, SlotIdentity,
+        };
+        use buzz_seat_clerk::session_identity::SessionMarker;
+
+        let live = SessionMarker::new("live-session-abc".to_string());
+        let mut writer = ReadStateWriter::new(SlotIdentity {
+            slot_id: generate_slot_id(),
+            client_id: generate_slot_id(),
+        });
+
+        let json =
+            r#"{"v":1,"channels":{"chan-one":1000,"chan-two":2000},"marker":"wrong-session-xyz"}"#;
+        let ack = parse_multi_channel_ack(json).expect("must parse");
+        let actor = SessionMarker::new(ack.marker.clone());
+
+        for (channel, ts) in &ack.channels {
+            let result = record_youyou_read(&mut writer, channel.clone(), *ts, &actor, &live);
+            assert_eq!(
+                result,
+                Err(ReadGuardError::NotLiveSession),
+                "wrong marker must be refused for channel {channel}"
+            );
+        }
+
+        // Neither bookmark must have advanced.
+        assert_eq!(writer.read_at_for("chan-one"), None);
+        assert_eq!(writer.read_at_for("chan-two"), None);
     }
 }
