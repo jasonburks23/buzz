@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::discovery::{ChannelInfo, ChannelType};
@@ -95,6 +96,89 @@ pub fn unread_badge(
         total_unread,
         badge_unread,
     }
+}
+
+/// Serializable kind string for a channel, for use in the sidecar JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelKind {
+    Dm,
+    Stream,
+    Unknown,
+}
+
+impl From<&ChannelType> for ChannelKind {
+    fn from(t: &ChannelType) -> Self {
+        match t {
+            ChannelType::Dm => ChannelKind::Dm,
+            ChannelType::Stream => ChannelKind::Stream,
+            ChannelType::Unknown => ChannelKind::Unknown,
+        }
+    }
+}
+
+/// Per-channel unread summary for the sidecar file.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelBadge {
+    pub channel_id: Uuid,
+    pub name: String,
+    pub kind: ChannelKind,
+    pub total_unread: u32,
+    pub badge_unread: u32,
+}
+
+/// Compute per-channel unread summaries, returning one entry per channel that
+/// has `total_unread > 0`.
+///
+/// Uses the same unread/badge logic as `unread_badge` so the two can never
+/// disagree. Channels not present in `channels` are treated as `Unknown` type.
+///
+/// The returned Vec is sorted so channels with `badge_unread > 0` come first.
+pub fn per_channel_badges(
+    mailbox: &Mailbox,
+    read_state: &ReadStateWriter,
+    channels: &HashMap<Uuid, ChannelInfo>,
+    seat_pubkey_hex: &str,
+) -> Vec<ChannelBadge> {
+    let mut result: Vec<ChannelBadge> = Vec::new();
+
+    for channel_id in mailbox.channel_ids() {
+        let entries = mailbox.channel_entries(channel_id).unwrap_or_default();
+        let read_at = read_state.read_at_for(&channel_id.to_string());
+        let info = channels.get(channel_id);
+        let is_dm = info
+            .map(|i| i.channel_type == ChannelType::Dm)
+            .unwrap_or(false);
+        let b = compute_badge(entries, read_at, is_dm, seat_pubkey_hex);
+
+        if b.total_unread == 0 {
+            continue;
+        }
+
+        let kind = info
+            .map(|i| ChannelKind::from(&i.channel_type))
+            .unwrap_or(ChannelKind::Unknown);
+        let name = info.map(|i| i.name.clone()).unwrap_or_default();
+
+        // Saturating cast: u64 -> u32. Badge counts this large are not realistic
+        // in practice, but we guard against overflow rather than panicking.
+        result.push(ChannelBadge {
+            channel_id: *channel_id,
+            name,
+            kind,
+            total_unread: b.total_unread.min(u32::MAX as u64) as u32,
+            badge_unread: b.badge_unread.min(u32::MAX as u64) as u32,
+        });
+    }
+
+    // Sort: badge_unread > 0 first, then by channel_id for determinism.
+    result.sort_by(|a, b| {
+        b.badge_unread
+            .cmp(&a.badge_unread)
+            .then_with(|| a.channel_id.cmp(&b.channel_id))
+    });
+
+    result
 }
 
 #[cfg(test)]
@@ -357,6 +441,141 @@ mod tests {
         assert_eq!(
             after.badge_unread, 1,
             "mention in filed message must appear in badge_unread"
+        );
+    }
+
+    // ── per_channel_badges tests ──────────────────────────────────────────────
+
+    // (a) A DM channel yields an entry with badge_unread > 0.
+    #[test]
+    fn per_channel_dm_yields_badge_unread() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, dm_channel(ch));
+
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+
+        let writer = test_writer();
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(badges.len(), 1, "DM with unread must produce one entry");
+        assert!(
+            badges[0].badge_unread > 0,
+            "DM unread must yield badge_unread > 0"
+        );
+        assert_eq!(badges[0].kind, super::ChannelKind::Dm);
+    }
+
+    // (b) A mention in a stream channel yields badge_unread > 0.
+    #[test]
+    fn per_channel_stream_mention_yields_badge_unread() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, stream_channel(ch));
+
+        // Message with a p-tag mention of the seat.
+        mailbox.insert(
+            ch,
+            mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![SEAT_PK.to_string()]),
+        );
+
+        let writer = test_writer();
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(badges.len(), 1);
+        assert!(
+            badges[0].badge_unread > 0,
+            "stream mention must yield badge_unread > 0"
+        );
+        assert_eq!(badges[0].kind, super::ChannelKind::Stream);
+    }
+
+    // (c) A plain stream message (no mention) yields total_unread > 0 but badge_unread == 0.
+    #[test]
+    fn per_channel_plain_stream_message_no_badge_unread() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, stream_channel(ch));
+
+        // Plain message with no p-tags.
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+
+        let writer = test_writer();
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(badges.len(), 1, "non-empty stream must produce one entry");
+        assert!(badges[0].total_unread > 0, "total_unread must be > 0");
+        assert_eq!(
+            badges[0].badge_unread, 0,
+            "plain stream message must not set badge_unread"
+        );
+    }
+
+    // (d) A fully-read channel is omitted from the result.
+    #[test]
+    fn per_channel_fully_read_channel_omitted() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, dm_channel(ch));
+
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+
+        // Mark the channel read at ts=100 (so e1 is not unread).
+        let mut writer = test_writer();
+        let live = SessionMarker::new("live-session-001".to_string());
+        record_youyou_read(&mut writer, ch.to_string(), 100, &live, &live).expect("record read");
+
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert!(
+            badges.is_empty(),
+            "fully-read channel must be absent from per_channel_badges"
+        );
+    }
+
+    // (e) Channels with badge_unread > 0 sort before channels with badge_unread == 0.
+    #[test]
+    fn per_channel_badge_channels_sort_first() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch_stream = Uuid::new_v4();
+        let ch_dm = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch_stream, stream_channel(ch_stream));
+        channels.insert(ch_dm, dm_channel(ch_dm));
+
+        // Plain stream message (total_unread=1, badge_unread=0).
+        mailbox.insert(
+            ch_stream,
+            mailbox_entry_for("e1", 100, ch_stream, OTHER_PK, vec![]),
+        );
+        // DM message (total_unread=1, badge_unread=1).
+        mailbox.insert(ch_dm, mailbox_entry_for("e2", 100, ch_dm, OTHER_PK, vec![]));
+
+        let writer = test_writer();
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(badges.len(), 2, "must have two entries");
+        assert!(
+            badges[0].badge_unread > 0,
+            "first entry must have badge_unread > 0 (DM)"
+        );
+        assert_eq!(
+            badges[1].badge_unread, 0,
+            "second entry must have badge_unread == 0 (plain stream)"
         );
     }
 }
