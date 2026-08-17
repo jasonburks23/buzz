@@ -977,6 +977,7 @@ dependencies = [
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-seat-listener",
  "buzz-ws-client",
  "bytes",
  "chrono",

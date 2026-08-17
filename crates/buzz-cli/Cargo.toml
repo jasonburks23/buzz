@@ -69,6 +69,9 @@ url = { workspace = true }
 # Persona pack parsing, validation, and resolution
 buzz-persona = { path = "../buzz-persona" }
 
+# Read-ack helpers (MultiChannelAck, parse/write) reused by `buzz read-ack`
+buzz-seat-listener = { path = "../buzz-seat-listener" }
+
 # Platform app-data dir resolution — locates the desktop app's
 # channel-templates.json store for `channels create --template`
 dirs = "6"
