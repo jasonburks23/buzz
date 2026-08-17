@@ -55,8 +55,24 @@ function readAck(): AckMap | null {
   try {
     if (!existsSync(READACK_FILE)) return null;
     const raw = JSON.parse(readFileSync(READACK_FILE, "utf8"));
-    if (raw.v !== 1 || typeof raw.channels !== "object") return null;
-    return raw as AckMap;
+    // New multi-channel format: {"v":1,"channels":{"<uuid>":<ts>},"marker":"<str>"}
+    if (raw.v === 1 && typeof raw.channels === "object") {
+      return raw as AckMap;
+    }
+    // Backward compat: old single-channel format {"up_to_ts":<ts>}.
+    // Compute lastAckTs as the max across all channel values in the new format;
+    // for old files that max is just the single up_to_ts value.
+    // We synthesise an AckMap with an empty channels map but expose the scalar
+    // via a synthetic "__legacy__" key so pendingChannels keeps working.
+    const upToTs = Number(raw.up_to_ts);
+    if (Number.isFinite(upToTs) && upToTs > 0) {
+      // Return a synthetic AckMap. pendingChannels will not find any channel
+      // uuid in this map, so every channel in the wake file appears pending —
+      // which is the safe/correct behaviour when we cannot match per-channel.
+      // The bridge will fire and let the seat re-read to determine true need.
+      return { v: 1, channels: {}, marker: "legacy_up_to_ts" };
+    }
+    return null;
   } catch {
     return null;
   }

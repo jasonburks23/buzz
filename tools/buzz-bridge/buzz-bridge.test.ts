@@ -50,3 +50,13 @@ test("pendingChannels handles partial wake older than ack", () => {
   const ack = { v: 1, channels: { "chan-a": 100 }, marker: "sid" };
   expect(pendingChannels(wake, ack)).toEqual([]);
 });
+
+// Backward-compat: old up_to_ts files are converted to a synthetic AckMap
+// with empty channels. All wake channels appear pending (safe behaviour).
+test("pendingChannels marks all channels pending when ack has empty channels (legacy fallback)", () => {
+  const wake = { v: 1, channels: { "chan-a": 100, "chan-b": 200 } };
+  // Simulates the synthetic AckMap returned for old up_to_ts files
+  const legacyAck: AckMap = { v: 1, channels: {}, marker: "legacy_up_to_ts" };
+  const result = pendingChannels(wake, legacyAck).sort();
+  expect(result).toEqual(["chan-b", "chan-a"].sort());
+});
