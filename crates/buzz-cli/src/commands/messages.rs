@@ -350,6 +350,32 @@ fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
     }
 }
 
+/// Apply the autofold ack step: compute max created_at across events and write
+/// the readack marker via merge_and_write. This is a pure helper (no relay
+/// call) so it can be unit-tested without a live Nostr relay.
+///
+/// No-ops when the event list is empty (no ts to record).
+pub fn apply_autofold(
+    events: &[serde_json::Value],
+    channel_id: &str,
+    ack_file: &str,
+    marker: &str,
+) -> Result<(), CliError> {
+    let max_ts = events
+        .iter()
+        .filter_map(|e| e.get("created_at").and_then(|v| v.as_u64()))
+        .max();
+
+    let Some(ts) = max_ts else {
+        // No events, no timestamp to record. Silent no-op.
+        return Ok(());
+    };
+
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(channel_id.to_string(), ts);
+    crate::commands::read_ack::merge_and_write(ack_file, &channels, marker)
+}
+
 pub async fn cmd_get_messages(
     client: &BuzzClient,
     channel_id: &str,
@@ -358,6 +384,9 @@ pub async fn cmd_get_messages(
     since: Option<i64>,
     kinds: Option<&str>,
     format: &crate::OutputFormat,
+    ack: bool,
+    ack_file: Option<&str>,
+    ack_marker: Option<&str>,
 ) -> Result<(), CliError> {
     validate_uuid(channel_id)?;
     let limit = limit.unwrap_or(50).min(200);
@@ -388,6 +417,40 @@ pub async fn cmd_get_messages(
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
+
+    // Autofold: write the readack marker if --ack is set.
+    if ack {
+        // Resolve ack file: flag first, then env var READACK_FILE. Hard-error
+        // when neither is present.
+        let resolved_file = match ack_file {
+            Some(f) => f.to_string(),
+            None => std::env::var("READACK_FILE").map_err(|_| {
+                CliError::Usage(
+                    "--ack requires --ack-file <PATH> or READACK_FILE env var".to_string(),
+                )
+            })?,
+        };
+
+        // Resolve marker: flag first, then SEAT_SESSION env var. Hard-error when
+        // neither resolves to a non-empty value. A silently-defaulted marker
+        // breaks the clerk honest-seen gate (the guard compares against the live
+        // claim file and a stale or default marker never matches).
+        let resolved_marker = match ack_marker {
+            Some(m) if !m.is_empty() => m.to_string(),
+            _ => {
+                let from_env = std::env::var("SEAT_SESSION").unwrap_or_default();
+                if from_env.is_empty() {
+                    return Err(CliError::Usage(
+                        "--ack requires --ack-marker <MARKER> or SEAT_SESSION env var".to_string(),
+                    ));
+                }
+                from_env
+            }
+        };
+
+        apply_autofold(&events, channel_id, &resolved_file, &resolved_marker)?;
+    }
+
     Ok(())
 }
 
@@ -950,6 +1013,9 @@ pub async fn dispatch(
             before,
             since,
             kinds,
+            ack,
+            ack_file,
+            ack_marker,
         } => {
             cmd_get_messages(
                 client,
@@ -959,6 +1025,9 @@ pub async fn dispatch(
                 since,
                 kinds.as_deref(),
                 format,
+                ack,
+                ack_file.as_deref(),
+                ack_marker.as_deref(),
             )
             .await
         }
@@ -1371,5 +1440,93 @@ mod tests {
             profile_event(PK_VALID_A, Some("Aaron"), None),
         ];
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
+    }
+
+    // ---- autofold tests ----
+
+    use super::apply_autofold;
+    use crate::commands::read_ack::merge_and_write;
+    use buzz_seat_clerk::read_ack::parse_multi_channel_ack;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+
+    const CHANNEL_UUID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn make_events(created_ats: &[u64]) -> Vec<serde_json::Value> {
+        created_ats
+            .iter()
+            .map(|&ts| serde_json::json!({"id": "aa", "content": "hi", "created_at": ts}))
+            .collect()
+    }
+
+    // (a) get --ack writes marker at max created_at across fetched events.
+    #[test]
+    fn autofold_writes_max_created_at() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[100, 300, 200]);
+
+        apply_autofold(&events, CHANNEL_UUID, &path, "sess-abc").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(parsed.channels[CHANNEL_UUID], 300, "max created_at is 300");
+        assert_eq!(parsed.marker, "sess-abc");
+    }
+
+    // (b) get --ack with no resolvable file produces error and writes nothing.
+    // (tested in read_ack.rs resolve_file tests; here we confirm apply_autofold
+    //  propagates a path error cleanly when the path is unwritable.)
+    #[test]
+    fn autofold_errors_when_path_unwritable() {
+        // Use a path in a nonexistent directory — the write will fail.
+        let bad_path = "/tmp/nonexistent-dir-353/readack.json";
+        let events = make_events(&[100]);
+        let result = apply_autofold(&events, CHANNEL_UUID, bad_path, "sess-x");
+        assert!(result.is_err(), "must error on unwritable path");
+    }
+
+    // (c) messages get WITHOUT --ack writes no marker: the no-ack gate is
+    // structural (`if ack { apply_autofold(...) }` in cmd_get_messages) and
+    // cannot be exercised without a live relay. The empty/no-op write path
+    // (apply_autofold called with zero events) is covered by
+    // autofold_empty_events_writes_nothing below.
+
+    // (d) merge max-wins: a lower incoming ts does not regress a higher stored ts.
+    #[test]
+    fn autofold_merge_max_wins_no_regression() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+
+        // Pre-write a higher ts directly via merge_and_write.
+        let mut seed: HashMap<String, u64> = HashMap::new();
+        seed.insert(CHANNEL_UUID.to_string(), 500);
+        merge_and_write(&path, &seed, "sess-old").unwrap();
+
+        // Now apply_autofold with a lower max ts (300 < 500).
+        let events = make_events(&[100, 300]);
+        apply_autofold(&events, CHANNEL_UUID, &path, "sess-new").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(
+            parsed.channels[CHANNEL_UUID], 500,
+            "existing 500 must not be regressed by incoming 300"
+        );
+    }
+
+    // (e) empty event list: apply_autofold with no events writes nothing (no crash,
+    //     no empty channel entry with ts=0).
+    #[test]
+    fn autofold_empty_events_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let events: Vec<serde_json::Value> = vec![];
+        apply_autofold(&events, CHANNEL_UUID, &path, "sess-empty").unwrap();
+        // File should NOT be created when there are no events to ack.
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "no file should be written for empty event list"
+        );
     }
 }
