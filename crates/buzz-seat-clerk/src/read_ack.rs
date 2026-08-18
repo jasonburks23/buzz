@@ -10,8 +10,13 @@
 //!   `{"v":1,"channels":{"<uuid>":<unix_secs>,...},"marker":"<session_id>"}`
 
 use std::collections::HashMap;
+use std::io::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
+
+use crate::error::ClerkError;
 
 /// A parsed read-acknowledgment from the live session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +73,19 @@ pub fn parse_multi_channel_ack(bytes: &str) -> Option<MultiChannelAck> {
         return None;
     }
     Some(raw)
+}
+
+/// Write a MultiChannelAck to a file atomically.
+///
+/// Serializes to JSON, writes to a temp file in the target's parent directory,
+/// then persists (renames) it into place so a reader never sees a partial file.
+pub fn write_multi_channel_ack(path: &str, ack: &MultiChannelAck) -> Result<(), ClerkError> {
+    let json = serde_json::to_string(ack)?;
+    let parent = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(json.as_bytes())?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -144,5 +162,26 @@ mod tests {
     fn multi_channel_ack_missing_channels_field_returns_none() {
         let json = r#"{"v":1,"marker":"sid"}"#;
         assert_eq!(parse_multi_channel_ack(json), None);
+    }
+
+    #[test]
+    fn write_multi_channel_ack_roundtrips() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let ack = MultiChannelAck {
+            v: 1,
+            channels: [
+                ("chan-a".to_string(), 100u64),
+                ("chan-b".to_string(), 200u64),
+            ]
+            .into_iter()
+            .collect(),
+            marker: "test-session".to_string(),
+        };
+        write_multi_channel_ack(&path, &ack).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse back");
+        assert_eq!(parsed, ack);
     }
 }

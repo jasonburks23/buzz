@@ -69,6 +69,11 @@ url = { workspace = true }
 # Persona pack parsing, validation, and resolution
 buzz-persona = { path = "../buzz-persona" }
 
+# Read-ack helpers (MultiChannelAck, parse/write) reused by `buzz read-ack`.
+# On canonical main the read-ack module lives in buzz-seat-clerk (the monolith
+# clerk crate), not the retired buzz-seat-listener crate.
+buzz-seat-clerk = { path = "../buzz-seat-clerk" }
+
 # Platform app-data dir resolution — locates the desktop app's
 # channel-templates.json store for `channels create --template`
 dirs = "6"

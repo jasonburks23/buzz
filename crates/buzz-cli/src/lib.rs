@@ -240,6 +240,25 @@ enum Cmd {
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
+    /// Write the read-watermark handoff file consumed by the seat clerk (local, no relay needed)
+    #[command(
+        name = "read-ack",
+        after_help = "Examples:\n  buzz read-ack --channel <UUID> --up-to 1720000000\n  buzz read-ack --channel <UUID1> --up-to 1720000000 --channel <UUID2> --up-to 1720000001 --file /tmp/readack.json\n\nTarget file (first wins): --file flag, then READACK_FILE env var.\nMarker (first wins): --marker flag, then SEAT_SESSION env var, then CLERK_SESSION_ID env var, then \"default\"."
+    )]
+    ReadAck {
+        /// Channel UUID(s) to acknowledge. Repeatable; paired by position with --up-to.
+        #[arg(long = "channel", required = true)]
+        channels: Vec<String>,
+        /// Unix-seconds timestamp(s) read up to. Repeatable; paired by position with --channel.
+        #[arg(long = "up-to", required = true)]
+        up_to: Vec<u64>,
+        /// Target handoff file path. Overrides READACK_FILE env var.
+        #[arg(long)]
+        file: Option<String>,
+        /// Session marker written into the ack. Overrides SEAT_SESSION / CLERK_SESSION_ID env vars.
+        #[arg(long)]
+        marker: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -1959,6 +1978,27 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // read-ack is local-only: writes a handoff file, no relay connection needed.
+    if let Cmd::ReadAck {
+        ref channels,
+        ref up_to,
+        ref file,
+        ref marker,
+    } = cli.command
+    {
+        if channels.len() != up_to.len() {
+            return Err(CliError::Usage(
+                "each --channel must have a matching --up-to (counts differ)".to_string(),
+            ));
+        }
+        let pairs: Vec<(String, u64)> = channels
+            .iter()
+            .cloned()
+            .zip(up_to.iter().copied())
+            .collect();
+        return commands::read_ack::cmd_read_ack(pairs, file.as_deref(), marker.as_deref());
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2019,6 +2059,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
         Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::ReadAck { .. } => unreachable!("handled above"),
     }
 }
 
@@ -2122,6 +2163,7 @@ mod tests {
             "pr",
             "projects",
             "reactions",
+            "read-ack",
             "repos",
             "social",
             "upload",

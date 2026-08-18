@@ -31,7 +31,8 @@ rand           = { workspace = true }
 base64         = { workspace = true }
 sha2           = { workspace = true }
 hex            = { workspace = true }
+# Atomic file writes for write_multi_channel_ack (temp file + rename).
+tempfile       = "3"
 
 [dev-dependencies]
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
-tempfile = "3"
