@@ -480,7 +480,7 @@ pub enum MessagesCmd {
     },
     /// Retrieve messages from a channel
     #[command(
-        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984"
+        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984\n  buzz messages get --channel <UUID> --ack"
     )]
     Get {
         /// Channel UUID
@@ -489,15 +489,25 @@ pub enum MessagesCmd {
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
-        /// Unix timestamp — return messages before this time
+        /// Unix timestamp: return messages before this time
         #[arg(long)]
         before: Option<i64>,
-        /// Unix timestamp — return messages after this time
+        /// Unix timestamp: return messages after this time
         #[arg(long)]
         since: Option<i64>,
         /// Comma-separated event kinds to filter (e.g. 1,1984)
         #[arg(long)]
         kinds: Option<String>,
+        /// After fetching, write the read-ack marker for this channel.
+        /// Requires READACK_FILE and SEAT_SESSION env vars (or --ack-file and --ack-marker).
+        #[arg(long, default_value_t = false)]
+        ack: bool,
+        /// Path to the readack file. Overrides READACK_FILE env var.
+        #[arg(long)]
+        ack_file: Option<String>,
+        /// Session marker to embed in the readack file. Overrides SEAT_SESSION env var.
+        #[arg(long)]
+        ack_marker: Option<String>,
     },
     /// Get a message thread (replies to a root message)
     Thread {
