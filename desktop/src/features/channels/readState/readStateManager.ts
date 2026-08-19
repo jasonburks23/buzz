@@ -377,9 +377,9 @@ export class ReadStateManager {
     }
   }
 
-  /** Route a seat's operator-addressed copy into effectiveState, max-merged. */
+  /** Route a seat operator-copy into effectiveState; discards non-roster authors (#383 follow-up). */
   private async handleOperatorEvent(event: RelayEvent): Promise<void> {
-    if (this.destroyed) return;
+    if (this.destroyed || !this.seatRoster.includes(event.pubkey)) return;
     const merged = await this.mergeOperatorEvent(event);
     if (!merged || this.destroyed) return;
     const { advanced, createdAt } = merged;
