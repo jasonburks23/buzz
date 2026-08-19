@@ -207,6 +207,10 @@ async fn main() -> Result<()> {
                                             ts = ts,
                                             "multi-channel read-ack advanced bookmark"
                                         );
+                                        // Prune mailbox entries at/below the new watermark.
+                                        if let Ok(uuid) = channel.parse::<Uuid>() {
+                                            mailbox.prune_channel_below(&uuid, *ts);
+                                        }
                                     }
                                     Err(ReadGuardError::NotLiveSession) => {
                                         warn!(
@@ -230,6 +234,10 @@ async fn main() -> Result<()> {
                                         ts = ack.up_to_ts,
                                         "read-ack advanced bookmark"
                                     );
+                                    // Prune mailbox entries at/below the new watermark.
+                                    if let Ok(uuid) = ack.channel.parse::<Uuid>() {
+                                        mailbox.prune_channel_below(&uuid, ack.up_to_ts);
+                                    }
                                 }
                                 Err(ReadGuardError::NotLiveSession) => {
                                     warn!(
