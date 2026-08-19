@@ -267,7 +267,7 @@ async fn main() -> Result<()> {
                             now_secs(),
                             &mut writer,
                             &emitter,
-                            &mailbox,
+                            &mut mailbox,
                             &channels,
                             &cfg.public_key_hex,
                         );
@@ -496,7 +496,7 @@ fn apply_readack_and_refresh(
     now: u64,
     writer: &mut ReadStateWriter,
     emitter: &WakeEmitter,
-    mailbox: &Mailbox,
+    mailbox: &mut Mailbox,
     channels: &HashMap<Uuid, ChannelInfo>,
     seat_pubkey_hex: &str,
 ) -> bool {
@@ -510,6 +510,10 @@ fn apply_readack_and_refresh(
                 Ok(()) => {
                     advanced = true;
                     debug!(channel = %channel, ts = ts, "multi-channel read-ack advanced bookmark");
+                    // Prune mailbox entries at/below the new watermark.
+                    if let Ok(uuid) = channel.parse::<Uuid>() {
+                        mailbox.prune_channel_below(&uuid, *ts);
+                    }
                 }
                 Err(ReadGuardError::NotLiveSession) => {
                     warn!(channel = %channel, "multi-channel read-ack from non-live actor ignored");
@@ -527,6 +531,10 @@ fn apply_readack_and_refresh(
             Ok(()) => {
                 advanced = true;
                 debug!(channel = %ack.channel, ts = ack.up_to_ts, "read-ack advanced bookmark");
+                // Prune mailbox entries at/below the new watermark.
+                if let Ok(uuid) = ack.channel.parse::<Uuid>() {
+                    mailbox.prune_channel_below(&uuid, ack.up_to_ts);
+                }
             }
             Err(ReadGuardError::NotLiveSession) => {
                 warn!(channel = %ack.channel, "read-ack from non-live actor ignored");
@@ -649,7 +657,7 @@ mod tests {
                 2_000,
                 &mut writer,
                 &emitter,
-                &mailbox,
+                &mut mailbox,
                 &channels,
                 SEAT_PK,
             );
@@ -689,7 +697,7 @@ mod tests {
                 2_000,
                 &mut writer,
                 &emitter,
-                &mailbox,
+                &mut mailbox,
                 &channels,
                 SEAT_PK,
             );
