@@ -627,6 +627,20 @@ mod tests {
     // Scenario 2: Bad-path fixture — proves a specific test goes RED when a
     //             timer is wired to emit(), then returns to green on restore.
     //
+    // REPRODUCIBLE MUTATION PROOF (the load-bearing, reviewer-runnable one):
+    //   The production lane-gate is `wake.rs` `emit_if_lane_1`:
+    //       if *lane == Lane::ForMe { self.emit(unix_secs)?; }
+    //   Break it (e.g. replace the body with an unconditional `self.emit(...)`,
+    //   so ANY lane — including a timer's Delivery-lane tick — wakes the seat):
+    //     -> US21-T2 (timer-negative) goes RED: "TIMER-NEGATIVE FAILED".
+    //     -> US21-T1 (positive control) stays GREEN, proving the negative is not
+    //        passing merely because the wake mechanism is broken.
+    //   Byte-identical restore of that one line returns the suite to green.
+    //   Verified 2026-08-19. This mutation targets PRODUCTION code, so T2 is a
+    //   guard on the real gate, not on test text. (US21-T3 below is a secondary,
+    //   self-contained demonstration that emit() writes the wake file; the
+    //   reproducible proof of T2's non-vacuity is the wake.rs mutation above.)
+    //
     // Allowlisted timer: connection.rs:86 `tokio::time::sleep(delay)` is the
     // reconnect-backoff.  It has no WakeEmitter reference and cannot reach
     // emit().  The allowlist is documented in the structural seam test below.
