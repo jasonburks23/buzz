@@ -480,7 +480,7 @@ pub enum MessagesCmd {
     },
     /// Retrieve messages from a channel
     #[command(
-        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984\n  buzz messages get --channel <UUID> --ack"
+        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984\n  buzz messages get --channel <UUID> --ack\n  buzz messages get --channel <UUID> --no-ack"
     )]
     Get {
         /// Channel UUID
@@ -498,10 +498,16 @@ pub enum MessagesCmd {
         /// Comma-separated event kinds to filter (e.g. 1,1984)
         #[arg(long)]
         kinds: Option<String>,
-        /// After fetching, write the read-ack marker for this channel.
+        /// Force write the read-ack marker for this channel after fetching.
         /// Requires READACK_FILE and SEAT_SESSION env vars (or --ack-file and --ack-marker).
+        /// Hard-errors if the file or marker cannot be resolved.
         #[arg(long, default_value_t = false)]
         ack: bool,
+        /// Suppress the read-ack marker write even when seat context (READACK_FILE +
+        /// SEAT_SESSION) is present. Use this to do a bare read without advancing the
+        /// watermark. Overrides the default auto-ack behaviour.
+        #[arg(long, default_value_t = false)]
+        no_ack: bool,
         /// Path to the readack file. Overrides READACK_FILE env var.
         #[arg(long)]
         ack_file: Option<String>,

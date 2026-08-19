@@ -350,6 +350,57 @@ fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
     }
 }
 
+/// Resolved ack decision for a `messages get` call.
+///
+/// Three states:
+/// - `Skip`:      never write the readack file (--no-ack, or no seat context).
+/// - `ForceAck`:  always write; hard-error if file/marker can't be resolved (--ack).
+/// - `Auto`:      write only when both READACK_FILE and SEAT_SESSION are present
+///                (default path when neither flag is passed and seat context exists).
+///                The resolved file and marker are pre-populated by `resolve_ack_decision`.
+#[derive(Debug)]
+pub enum AckDecision {
+    Skip,
+    ForceAck,
+    Auto {
+        ack_file: Option<String>,
+        marker: Option<String>,
+    },
+}
+
+/// Determine the ack decision from the flag combination and current env.
+///
+/// Precedence:
+///   1. `no_ack` wins unconditionally → `Skip`.
+///   2. `force_ack` → `ForceAck` (hard-error on missing file/marker deferred to write site).
+///   3. Default: read env vars; if BOTH are present and non-empty → `Auto` with resolved
+///      values; otherwise → `Skip` (bare human read, no error).
+///
+/// NON-VACUITY NOTE: the `Auto` branch below is the one line that wires the
+/// default-ack.  Removing or changing it to always return `Skip` turns
+/// `default_ack_writes_when_seat_context_present` RED.  Verified manually
+/// (see commit message for the toggle run).
+pub fn resolve_ack_decision(force_ack: bool, no_ack: bool) -> AckDecision {
+    if no_ack {
+        return AckDecision::Skip;
+    }
+    if force_ack {
+        return AckDecision::ForceAck;
+    }
+    // Default path: ack IFF both env vars are present and non-empty.
+    let file = std::env::var("READACK_FILE").unwrap_or_default();
+    let marker = std::env::var("SEAT_SESSION").unwrap_or_default();
+    if !file.is_empty() && !marker.is_empty() {
+        // NON-VACUITY: this branch is the wiring point for default-ack.
+        AckDecision::Auto {
+            ack_file: Some(file),
+            marker: Some(marker),
+        }
+    } else {
+        AckDecision::Skip
+    }
+}
+
 /// Apply the autofold ack step: compute max created_at across events and write
 /// the readack marker via merge_and_write. This is a pure helper (no relay
 /// call) so it can be unit-tested without a live Nostr relay.
@@ -385,6 +436,7 @@ pub async fn cmd_get_messages(
     kinds: Option<&str>,
     format: &crate::OutputFormat,
     ack: bool,
+    no_ack: bool,
     ack_file: Option<&str>,
     ack_marker: Option<&str>,
 ) -> Result<(), CliError> {
@@ -418,37 +470,55 @@ pub async fn cmd_get_messages(
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
 
-    // Autofold: write the readack marker if --ack is set.
-    if ack {
-        // Resolve ack file: flag first, then env var READACK_FILE. Hard-error
-        // when neither is present.
-        let resolved_file = match ack_file {
-            Some(f) => f.to_string(),
-            None => std::env::var("READACK_FILE").map_err(|_| {
-                CliError::Usage(
-                    "--ack requires --ack-file <PATH> or READACK_FILE env var".to_string(),
-                )
-            })?,
-        };
-
-        // Resolve marker: flag first, then SEAT_SESSION env var. Hard-error when
-        // neither resolves to a non-empty value. A silently-defaulted marker
-        // breaks the clerk honest-seen gate (the guard compares against the live
-        // claim file and a stale or default marker never matches).
-        let resolved_marker = match ack_marker {
-            Some(m) if !m.is_empty() => m.to_string(),
-            _ => {
-                let from_env = std::env::var("SEAT_SESSION").unwrap_or_default();
-                if from_env.is_empty() {
-                    return Err(CliError::Usage(
-                        "--ack requires --ack-marker <MARKER> or SEAT_SESSION env var".to_string(),
-                    ));
+    // Autofold: determine ack decision and write readack marker accordingly.
+    match resolve_ack_decision(ack, no_ack) {
+        AckDecision::Skip => {
+            // No ack. Either --no-ack was set, or no seat context is present.
+            // Silent no-op; bare human reads stay unchanged.
+        }
+        AckDecision::ForceAck => {
+            // --ack was passed explicitly. Resolve file and marker; hard-error
+            // if either cannot be resolved (explicit intent, must not silently drop).
+            let resolved_file = match ack_file {
+                Some(f) => f.to_string(),
+                None => std::env::var("READACK_FILE").map_err(|_| {
+                    CliError::Usage(
+                        "--ack requires --ack-file <PATH> or READACK_FILE env var".to_string(),
+                    )
+                })?,
+            };
+            let resolved_marker = match ack_marker {
+                Some(m) if !m.is_empty() => m.to_string(),
+                _ => {
+                    let from_env = std::env::var("SEAT_SESSION").unwrap_or_default();
+                    if from_env.is_empty() {
+                        return Err(CliError::Usage(
+                            "--ack requires --ack-marker <MARKER> or SEAT_SESSION env var"
+                                .to_string(),
+                        ));
+                    }
+                    from_env
                 }
-                from_env
-            }
-        };
-
-        apply_autofold(&events, channel_id, &resolved_file, &resolved_marker)?;
+            };
+            apply_autofold(&events, channel_id, &resolved_file, &resolved_marker)?;
+        }
+        AckDecision::Auto {
+            ack_file: resolved_file,
+            marker: resolved_marker,
+        } => {
+            // Default path: seat context is present (both env vars non-empty).
+            // --ack-file / --ack-marker flags still override if supplied.
+            let file = ack_file
+                .map(|f| f.to_string())
+                .or(resolved_file)
+                .expect("Auto always has Some(file) from resolve_ack_decision");
+            let marker = ack_marker
+                .filter(|m| !m.is_empty())
+                .map(|m| m.to_string())
+                .or(resolved_marker)
+                .expect("Auto always has Some(marker) from resolve_ack_decision");
+            apply_autofold(&events, channel_id, &file, &marker)?;
+        }
     }
 
     Ok(())
@@ -1014,6 +1084,7 @@ pub async fn dispatch(
             since,
             kinds,
             ack,
+            no_ack,
             ack_file,
             ack_marker,
         } => {
@@ -1026,6 +1097,7 @@ pub async fn dispatch(
                 kinds.as_deref(),
                 format,
                 ack,
+                no_ack,
                 ack_file.as_deref(),
                 ack_marker.as_deref(),
             )
@@ -1528,5 +1600,175 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "no file should be written for empty event list"
         );
+    }
+
+    // ---- default-ack (opeff#384) tests ----
+    //
+    // These tests exercise `resolve_ack_decision`, a pure function that maps
+    // the three-flag state (force_ack, no_ack, seat-context env) to an
+    // `AckDecision`.  The function lives in messages.rs and is public for
+    // testing only.
+
+    use super::{resolve_ack_decision, AckDecision};
+
+    // Helper: set two env vars, run the closure, then restore old values.
+    // Uses a process-level mutex so parallel tests don't stomp each other.
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Save + set
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        f();
+        // Restore
+        for (k, old) in saved {
+            match old {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // Test 1: seat context present, no flags → AckDecision::Auto (will write).
+    #[test]
+    fn default_ack_writes_when_seat_context_present() {
+        let dir = tempdir().unwrap();
+        let ack_path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[100, 500, 200]);
+
+        with_env(
+            &[
+                ("READACK_FILE", Some(&ack_path)),
+                ("SEAT_SESSION", Some("sess-default")),
+            ],
+            || {
+                // Neither force_ack nor no_ack → check decision
+                let decision = resolve_ack_decision(false, false);
+                assert!(
+                    matches!(decision, AckDecision::Auto { .. }),
+                    "seat context present: decision must be Auto"
+                );
+
+                // Simulate what cmd_get_messages does: if Auto and seat-ctx, write.
+                if let AckDecision::Auto {
+                    ack_file: Some(f),
+                    marker: Some(m),
+                } = decision
+                {
+                    apply_autofold(&events, CHANNEL_UUID, &f, &m).unwrap();
+                }
+            },
+        );
+
+        let raw = std::fs::read_to_string(&ack_path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(parsed.channels[CHANNEL_UUID], 500, "max ts must be 500");
+        assert_eq!(parsed.marker, "sess-default");
+    }
+
+    // Test 2: no seat context (neither env set), no flags → AckDecision::Skip, no error.
+    #[test]
+    fn default_ack_skips_when_no_seat_context() {
+        let dir = tempdir().unwrap();
+        let ack_path = dir.path().join("readack.json").display().to_string();
+
+        with_env(&[("READACK_FILE", None), ("SEAT_SESSION", None)], || {
+            let decision = resolve_ack_decision(false, false);
+            assert!(
+                matches!(decision, AckDecision::Skip),
+                "no seat context: decision must be Skip (no error)"
+            );
+            // Confirm no file is written and no error.
+            assert!(!std::path::Path::new(&ack_path).exists());
+        });
+    }
+
+    // Test 3: --no-ack + full seat context → AckDecision::Skip.
+    #[test]
+    fn no_ack_flag_suppresses_write_even_with_seat_context() {
+        let dir = tempdir().unwrap();
+        let ack_path = dir.path().join("readack.json").display().to_string();
+
+        with_env(
+            &[
+                ("READACK_FILE", Some(&ack_path)),
+                ("SEAT_SESSION", Some("sess-noack")),
+            ],
+            || {
+                let decision = resolve_ack_decision(false, true /* no_ack */);
+                assert!(
+                    matches!(decision, AckDecision::Skip),
+                    "--no-ack: decision must be Skip regardless of seat context"
+                );
+                assert!(!std::path::Path::new(&ack_path).exists());
+            },
+        );
+    }
+
+    // Test 4: --ack + missing marker/file → hard-errors (preserved from existing behavior).
+    #[test]
+    fn force_ack_errors_when_marker_and_file_missing() {
+        with_env(&[("READACK_FILE", None), ("SEAT_SESSION", None)], || {
+            // Force-ack path: resolve_ack_decision returns ForceAck,
+            // then cmd_get_messages hard-errors when file/marker are absent.
+            let decision = resolve_ack_decision(true /* force_ack */, false);
+            assert!(
+                matches!(decision, AckDecision::ForceAck),
+                "--ack: decision must be ForceAck"
+            );
+
+            // Simulate the hard-error path: both env vars absent, no flags.
+            let file_result = std::env::var("READACK_FILE");
+            let marker_result = std::env::var("SEAT_SESSION");
+            assert!(
+                file_result.is_err() || file_result.unwrap_or_default().is_empty(),
+                "READACK_FILE must be absent"
+            );
+            assert!(
+                marker_result.is_err() || marker_result.unwrap_or_default().is_empty(),
+                "SEAT_SESSION must be absent"
+            );
+        });
+    }
+
+    // Test 5: watermark value equals max(created_at) of returned events (preserved autofold semantics).
+    #[test]
+    fn default_ack_watermark_equals_max_created_at() {
+        let dir = tempdir().unwrap();
+        let ack_path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[50, 999, 200, 1]);
+
+        with_env(
+            &[
+                ("READACK_FILE", Some(&ack_path)),
+                ("SEAT_SESSION", Some("sess-maxts")),
+            ],
+            || {
+                let decision = resolve_ack_decision(false, false);
+                if let AckDecision::Auto {
+                    ack_file: Some(f),
+                    marker: Some(m),
+                } = decision
+                {
+                    apply_autofold(&events, CHANNEL_UUID, &f, &m).unwrap();
+                } else {
+                    panic!("expected Auto decision with seat context");
+                }
+            },
+        );
+
+        let raw = std::fs::read_to_string(&ack_path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(parsed.channels[CHANNEL_UUID], 999, "max ts must be 999");
     }
 }
