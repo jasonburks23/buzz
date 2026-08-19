@@ -268,6 +268,11 @@ struct StandardSessionState {
     published_seq: u64,
     last_cost: Option<f64>,
     cost_poisoned: bool,
+    cumulative_input: Option<u64>,
+    cumulative_output: Option<u64>,
+    cumulative_total: Option<u64>,
+    cumulative_cache_read: Option<u64>,
+    cumulative_cache_write: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -286,6 +291,11 @@ impl StandardUsageTracker {
                 published_seq: 0,
                 last_cost: Some(0.0),
                 cost_poisoned: false,
+                cumulative_input: None,
+                cumulative_output: None,
+                cumulative_total: None,
+                cumulative_cache_read: None,
+                cumulative_cache_write: None,
             });
     }
 
@@ -370,6 +380,27 @@ impl StandardUsageTracker {
             return None;
         }
 
+        // Fold per-turn token counts into session-cumulative accumulators.
+        // Each guard fires only when this turn carried that field, so a
+        // cost-only turn (inclusive_input == None) silently skips all five.
+        if let Some(v) = inclusive_input {
+            state.cumulative_input = Some(state.cumulative_input.unwrap_or(0).saturating_add(v));
+        }
+        if let Some(v) = output_tokens {
+            state.cumulative_output = Some(state.cumulative_output.unwrap_or(0).saturating_add(v));
+        }
+        if let Some(v) = total_tokens {
+            state.cumulative_total = Some(state.cumulative_total.unwrap_or(0).saturating_add(v));
+        }
+        if let Some(v) = cache_read {
+            state.cumulative_cache_read =
+                Some(state.cumulative_cache_read.unwrap_or(0).saturating_add(v));
+        }
+        if let Some(v) = cache_write {
+            state.cumulative_cache_write =
+                Some(state.cumulative_cache_write.unwrap_or(0).saturating_add(v));
+        }
+
         state.published_seq += 1;
         Some(TurnUsage {
             session_id,
@@ -384,12 +415,13 @@ impl StandardUsageTracker {
             turn_cost_usd: turn_cost,
             turn_cache_read_tokens: cache_read,
             turn_cache_write_tokens: cache_write,
-            cumulative_input_tokens: None,
-            cumulative_output_tokens: None,
-            cumulative_total_tokens: None,
+            cumulative_input_tokens: state.cumulative_input,
+            cumulative_output_tokens: state.cumulative_output,
+            cumulative_total_tokens: state.cumulative_total,
             cumulative_cost_usd: cumulative_cost,
-            cumulative_cache_read_tokens: None,
-            cumulative_cache_write_tokens: None,
+            cumulative_cache_read_tokens: state.cumulative_cache_read,
+            cumulative_cache_write_tokens: state.cumulative_cache_write,
+            // model unavailable here: StandardAdapterKind is the harness, not a model id; do not fabricate.
             model: None,
             pricing_identity: None,
         })
@@ -3485,5 +3517,126 @@ mod tests {
             !a2.delta_reliable,
             "A second turn must be poisoned: output absence from cross-session notification must hold even with no prior entry"
         );
+    }
+
+    // ── StandardUsageTracker tests ───────────────────────────────────────────
+
+    fn prompt_usage(
+        input: u64,
+        output: u64,
+        cached_read: Option<u64>,
+        cached_write: Option<u64>,
+    ) -> PromptResponseUsage {
+        PromptResponseUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_read_tokens: cached_read,
+            cached_write_tokens: cached_write,
+        }
+    }
+
+    /// Two turns with distinct per-turn values must produce a cumulative that
+    /// equals the sum, NOT just the most-recent turn value.
+    ///
+    /// Turn 1: input=100, output=50. Turn 2: input=200, output=80.
+    /// Expected after turn 2: cumulative_input=300, cumulative_output=130.
+    /// A bug that emits per-turn instead of accumulated would yield 200/80 — the
+    /// test is structurally non-vacuous (300 != 200, 130 != 80).
+    #[test]
+    fn cumulative_tokens_accumulate_across_turns() {
+        let mut tracker = StandardUsageTracker::default();
+
+        // Turn 1.
+        tracker.begin_turn("std-s1");
+        tracker.record_prompt_usage(
+            "std-s1",
+            prompt_usage(100, 50, None, None),
+            StandardAdapterKind::Claude,
+        );
+        let t1 = tracker.take().expect("turn 1 must produce usage");
+        assert_eq!(t1.turn_input_tokens, Some(100), "t1 turn input");
+        assert_eq!(t1.turn_output_tokens, Some(50), "t1 turn output");
+        // After turn 1: cumulatives == turn values (first accumulation).
+        assert_eq!(t1.cumulative_input_tokens, Some(100), "t1 cumulative input");
+        assert_eq!(
+            t1.cumulative_output_tokens,
+            Some(50),
+            "t1 cumulative output"
+        );
+
+        // Turn 2.
+        tracker.begin_turn("std-s1");
+        tracker.record_prompt_usage(
+            "std-s1",
+            prompt_usage(200, 80, None, None),
+            StandardAdapterKind::Claude,
+        );
+        let t2 = tracker.take().expect("turn 2 must produce usage");
+        assert_eq!(t2.turn_input_tokens, Some(200), "t2 turn input");
+        assert_eq!(t2.turn_output_tokens, Some(80), "t2 turn output");
+        // Cumulative must be the SUM across both turns — not just turn 2.
+        assert_eq!(
+            t2.cumulative_input_tokens,
+            Some(300),
+            "cumulative input must be 100+200=300, not just the last turn's 200"
+        );
+        assert_eq!(
+            t2.cumulative_output_tokens,
+            Some(130),
+            "cumulative output must be 50+80=130, not just the last turn's 80"
+        );
+
+        // model and pricing_identity must remain None (no-fabrication guard).
+        assert!(
+            t2.model.is_none(),
+            "model must be None: StandardAdapterKind is the harness, not a model id"
+        );
+        assert!(
+            t2.pricing_identity.is_none(),
+            "pricing_identity must be None: not available in StandardUsageTracker"
+        );
+    }
+
+    /// A cost-only turn (no prompt usage) must NOT advance the token cumulatives.
+    /// After a token turn (input=100, output=50), a cost-only turn arrives.
+    /// The token cumulatives must still read 100/50 after the cost-only take().
+    #[test]
+    fn cost_only_turn_does_not_advance_token_cumulative() {
+        let mut tracker = StandardUsageTracker::default();
+        tracker.seed_zero_baseline("std-cost");
+
+        // Turn 1: real token turn — seeds cumulatives.
+        tracker.begin_turn("std-cost");
+        tracker.record_prompt_usage(
+            "std-cost",
+            prompt_usage(100, 50, None, None),
+            StandardAdapterKind::Claude,
+        );
+        tracker.record_cost("std-cost", 0.05);
+        let t1 = tracker.take().expect("turn 1");
+        assert_eq!(t1.cumulative_input_tokens, Some(100));
+        assert_eq!(t1.cumulative_output_tokens, Some(50));
+
+        // Turn 2: cost-only (no record_prompt_usage call).
+        tracker.begin_turn("std-cost");
+        tracker.record_cost("std-cost", 0.10);
+        let t2 = tracker
+            .take()
+            .expect("turn 2 cost-only must produce usage (cost signal)");
+        // Token cumulatives must be UNCHANGED — still 100/50 from turn 1.
+        assert_eq!(
+            t2.cumulative_input_tokens,
+            Some(100),
+            "cost-only turn must not advance cumulative_input_tokens"
+        );
+        assert_eq!(
+            t2.cumulative_output_tokens,
+            Some(50),
+            "cost-only turn must not advance cumulative_output_tokens"
+        );
+        // The per-turn token fields for a cost-only turn must be None.
+        assert!(t2.turn_input_tokens.is_none(), "cost-only: no turn input");
+        assert!(t2.turn_output_tokens.is_none(), "cost-only: no turn output");
     }
 }

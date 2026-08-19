@@ -4425,8 +4425,9 @@ mod tests {
         assert_eq!(usage.turn_cache_write_tokens, Some(25));
         assert_eq!(usage.turn_cost_usd, Some(0.042));
         assert_eq!(usage.cumulative_cost_usd, Some(0.042));
-        assert_eq!(usage.cumulative_input_tokens, None);
-        assert_eq!(usage.cumulative_output_tokens, None);
+        // cumulative = inclusive_input (100+30+25=155) accumulated over one turn.
+        assert_eq!(usage.cumulative_input_tokens, Some(155));
+        assert_eq!(usage.cumulative_output_tokens, Some(20));
     }
 
     #[tokio::test]
@@ -4453,8 +4454,9 @@ mod tests {
             usage.cumulative_cost_usd, None,
             "Codex cost update is ignored"
         );
-        assert_eq!(usage.cumulative_input_tokens, None);
-        assert_eq!(usage.cumulative_output_tokens, None);
+        // cumulative = inclusive_input (90+40=130) accumulated over one turn.
+        assert_eq!(usage.cumulative_input_tokens, Some(130));
+        assert_eq!(usage.cumulative_output_tokens, Some(10));
     }
 
     #[tokio::test]
