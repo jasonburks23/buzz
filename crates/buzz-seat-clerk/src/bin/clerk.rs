@@ -190,55 +190,19 @@ async fn main() -> Result<()> {
                 if changed {
                     last_readack_mtime = current_mtime;
                     if let Ok(raw) = std::fs::read_to_string(readack_path) {
-                        // Try multi-channel format first (v1); fall back to single-channel.
-                        if let Some(multi_ack) = parse_multi_channel_ack(&raw) {
-                            let actor = SessionMarker::new(multi_ack.marker.clone());
-                            for (channel, ts) in &multi_ack.channels {
-                                match record_youyou_read(
-                                    &mut writer,
-                                    channel.clone(),
-                                    *ts,
-                                    &actor,
-                                    live,
-                                ) {
-                                    Ok(()) => {
-                                        debug!(
-                                            channel = %channel,
-                                            ts = ts,
-                                            "multi-channel read-ack advanced bookmark"
-                                        );
-                                    }
-                                    Err(ReadGuardError::NotLiveSession) => {
-                                        warn!(
-                                            channel = %channel,
-                                            "multi-channel read-ack from non-live actor ignored"
-                                        );
-                                    }
-                                }
-                            }
-                        } else if let Some(ack) = parse_read_ack(&raw) {
-                            match record_youyou_read(
-                                &mut writer,
-                                ack.channel.clone(),
-                                ack.up_to_ts,
-                                &SessionMarker::new(ack.marker.clone()),
-                                live,
-                            ) {
-                                Ok(()) => {
-                                    debug!(
-                                        channel = %ack.channel,
-                                        ts = ack.up_to_ts,
-                                        "read-ack advanced bookmark"
-                                    );
-                                }
-                                Err(ReadGuardError::NotLiveSession) => {
-                                    warn!(
-                                        channel = %ack.channel,
-                                        "read-ack from non-live actor ignored"
-                                    );
-                                }
-                            }
-                        }
+                        // Advance the bookmark for each channel the live session
+                        // read, and refresh the wake-count sidecar if anything
+                        // advanced (so reading mail drops the count immediately).
+                        apply_readack_and_refresh(
+                            &raw,
+                            live,
+                            now_secs(),
+                            &mut writer,
+                            &emitter,
+                            &mailbox,
+                            &channels,
+                            &cfg.public_key_hex,
+                        );
                     }
                 }
             }
@@ -433,12 +397,236 @@ fn deliver_event(
     lane
 }
 
+/// Apply a read-ack file's contents and refresh the wake-count sidecar.
+///
+/// For each channel the LIVE session has read, advance the read watermark
+/// (honest-seen: only the live actor may advance its own bookmark, gated by
+/// `record_youyou_read`). If any watermark advanced, immediately re-emit the
+/// badge sidecar so the bridge "N unread" wake count drops the moment mail is
+/// READ, not only when the next mention arrives.
+///
+/// This closes the gap where the clerk refreshed the badge solely on a
+/// `Lane::ForMe` wake (see the single `emit_badge_sidecar` call in the event
+/// loop): before this, reading your mail advanced the bookmark but never
+/// re-emitted the count, so the wake poke stayed stale until the next ping.
+///
+/// Returns true if at least one channel's bookmark advanced.
+// Orchestration helper: it needs the parse inputs (raw, live) plus every input
+// emit_badge_sidecar takes (writer, emitter, mailbox, channels, seat pubkey).
+// Grouping them into a struct would add surface for a single call site.
+#[allow(clippy::too_many_arguments)]
+fn apply_readack_and_refresh(
+    raw: &str,
+    live: &SessionMarker,
+    now: u64,
+    writer: &mut ReadStateWriter,
+    emitter: &WakeEmitter,
+    mailbox: &Mailbox,
+    channels: &HashMap<Uuid, ChannelInfo>,
+    seat_pubkey_hex: &str,
+) -> bool {
+    let mut advanced = false;
+
+    // Try multi-channel format first (v1); fall back to single-channel.
+    if let Some(multi_ack) = parse_multi_channel_ack(raw) {
+        let actor = SessionMarker::new(multi_ack.marker.clone());
+        for (channel, ts) in &multi_ack.channels {
+            match record_youyou_read(writer, channel.clone(), *ts, &actor, live) {
+                Ok(()) => {
+                    advanced = true;
+                    debug!(channel = %channel, ts = ts, "multi-channel read-ack advanced bookmark");
+                }
+                Err(ReadGuardError::NotLiveSession) => {
+                    warn!(channel = %channel, "multi-channel read-ack from non-live actor ignored");
+                }
+            }
+        }
+    } else if let Some(ack) = parse_read_ack(raw) {
+        match record_youyou_read(
+            writer,
+            ack.channel.clone(),
+            ack.up_to_ts,
+            &SessionMarker::new(ack.marker.clone()),
+            live,
+        ) {
+            Ok(()) => {
+                advanced = true;
+                debug!(channel = %ack.channel, ts = ack.up_to_ts, "read-ack advanced bookmark");
+            }
+            Err(ReadGuardError::NotLiveSession) => {
+                warn!(channel = %ack.channel, "read-ack from non-live actor ignored");
+            }
+        }
+    }
+
+    // Refresh the wake-count sidecar the moment a read advances the bookmark,
+    // so the bridge count reflects the read immediately (independent of new mail).
+    if advanced {
+        emitter.emit_badge_sidecar(now, mailbox, writer, channels, seat_pubkey_hex);
+    }
+
+    advanced
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use buzz_seat_clerk::read_state::{generate_slot_id, ReadStateWriter, SlotIdentity};
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use tempfile::tempdir;
+
+    // ── Wake-count refresh on read (the operator's acceptance bar) ──────────
+    //
+    // Proof that a seat READING its mail drops the bridge wake count. Exercises
+    // the real apply_readack_and_refresh: a live read-ack advances the bookmark
+    // AND re-emits the badge sidecar (what the bridge reads for "N unread").
+    mod readack_badge_refresh {
+        use super::*;
+        use buzz_seat_clerk::discovery::{ChannelInfo, ChannelType};
+        use buzz_seat_clerk::mailbox::{Mailbox, MailboxEntry};
+        use buzz_seat_clerk::session_identity::SessionMarker;
+        use buzz_seat_clerk::wake::WakeEmitter;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        const SEAT_PK: &str = "seat_pk_xyz";
+        const OTHER_PK: &str = "other_pk_abc";
+
+        fn writer_with_slot() -> ReadStateWriter {
+            ReadStateWriter::new(SlotIdentity {
+                slot_id: generate_slot_id(),
+                client_id: generate_slot_id(),
+            })
+        }
+
+        fn unread_entry(id: &str, created_at: u64, ch: Uuid) -> MailboxEntry {
+            MailboxEntry {
+                event_id: id.to_string(),
+                created_at,
+                author_pubkey: OTHER_PK.to_string(),
+                content: "m".to_string(),
+                p_tags: vec![],
+                channel_uuid: ch,
+            }
+        }
+
+        fn dm_channels(ch: Uuid) -> HashMap<Uuid, ChannelInfo> {
+            let mut m = HashMap::new();
+            m.insert(
+                ch,
+                ChannelInfo {
+                    uuid: ch,
+                    name: "dm".to_string(),
+                    channel_type: ChannelType::Dm,
+                },
+            );
+            m
+        }
+
+        /// Read the sidecar's total_unread for a channel; None if the channel
+        /// is absent (which means fully read = zero unread).
+        fn sidecar_unread(sidecar_path: &std::path::Path, ch: Uuid) -> Option<u64> {
+            let raw = std::fs::read_to_string(sidecar_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let ch_str = ch.to_string();
+            v["channels"]
+                .as_array()?
+                .iter()
+                .find(|c| c["id"].as_str() == Some(&ch_str))
+                .and_then(|c| c["total_unread"].as_u64())
+        }
+
+        // THE acceptance proof: after a live read-ack advances the watermark,
+        // the emitted wake count for that channel DROPS.
+        //
+        // NON-VACUITY: this passes ONLY because apply_readack_and_refresh
+        // re-emits the sidecar. Delete the `if advanced { emit }` line and the
+        // sidecar keeps the baseline (2 unread), so the final assert goes RED.
+        #[test]
+        fn live_readack_drops_the_wake_count() {
+            let dir = tempdir().unwrap();
+            let wake = dir.path().join("wake");
+            let sidecar = dir.path().join("wake.rooms");
+            let emitter = WakeEmitter::new(wake.to_str().unwrap().to_string());
+
+            let ch = Uuid::new_v4();
+            let channels = dm_channels(ch);
+            let mut mailbox = Mailbox::new();
+            mailbox.insert(ch, unread_entry("e1", 100, ch));
+            mailbox.insert(ch, unread_entry("e2", 200, ch));
+
+            let mut writer = writer_with_slot();
+            let live = SessionMarker::new("live-1".to_string());
+
+            // Baseline: before any read, both messages are unread.
+            emitter.emit_badge_sidecar(1_000, &mailbox, &writer, &channels, SEAT_PK);
+            assert_eq!(
+                sidecar_unread(&sidecar, ch),
+                Some(2),
+                "baseline: 2 unread before the read"
+            );
+
+            // The live session reads up to ts=200 via a multi-channel read-ack.
+            let raw = format!("{{\"v\":1,\"channels\":{{\"{ch}\":200}},\"marker\":\"live-1\"}}");
+            let advanced = apply_readack_and_refresh(
+                &raw,
+                &live,
+                2_000,
+                &mut writer,
+                &emitter,
+                &mailbox,
+                &channels,
+                SEAT_PK,
+            );
+
+            assert!(advanced, "a live read-ack must advance the watermark");
+            assert_eq!(
+                sidecar_unread(&sidecar, ch),
+                None,
+                "after the read, the wake count must drop (channel fully read = absent)"
+            );
+        }
+
+        // Guard: a read-ack from a NON-live actor must not advance or refresh.
+        #[test]
+        fn non_live_readack_does_not_drop_the_count() {
+            let dir = tempdir().unwrap();
+            let wake = dir.path().join("wake");
+            let sidecar = dir.path().join("wake.rooms");
+            let emitter = WakeEmitter::new(wake.to_str().unwrap().to_string());
+
+            let ch = Uuid::new_v4();
+            let channels = dm_channels(ch);
+            let mut mailbox = Mailbox::new();
+            mailbox.insert(ch, unread_entry("e1", 100, ch));
+
+            let mut writer = writer_with_slot();
+            let live = SessionMarker::new("live-1".to_string());
+
+            emitter.emit_badge_sidecar(1_000, &mailbox, &writer, &channels, SEAT_PK);
+            assert_eq!(sidecar_unread(&sidecar, ch), Some(1), "baseline: 1 unread");
+
+            // A DIFFERENT (non-live) actor tries to advance the bookmark.
+            let raw = format!("{{\"v\":1,\"channels\":{{\"{ch}\":100}},\"marker\":\"imposter\"}}");
+            let advanced = apply_readack_and_refresh(
+                &raw,
+                &live,
+                2_000,
+                &mut writer,
+                &emitter,
+                &mailbox,
+                &channels,
+                SEAT_PK,
+            );
+
+            assert!(!advanced, "a non-live read-ack must not advance");
+            assert_eq!(
+                sidecar_unread(&sidecar, ch),
+                Some(1),
+                "non-live read must not drop the count"
+            );
+        }
+    }
 
     #[test]
     fn is_own_event_true_when_equal() {
