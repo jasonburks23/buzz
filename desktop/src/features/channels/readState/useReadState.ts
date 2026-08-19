@@ -1,14 +1,13 @@
 import * as React from "react";
-import {
-  ReadStateManager,
-  type ContextParentResolver,
-} from "@/features/channels/readState/readStateManager";
+import { ReadStateManager } from "@/features/channels/readState/readStateManager";
+import type { ContextParentResolver } from "@/features/channels/readState/readStateMerge";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 
 const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
+const noopSetSeatRoster = () => {};
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -93,6 +92,10 @@ export function useReadState(
     [],
   );
 
+  const setSeatRoster = React.useCallback((pubkeys: string[]): void => {
+    managerRef.current?.setSeatRoster(pubkeys);
+  }, []);
+
   const isReady = Boolean(
     pubkey && relayClient && initializedPubkey === pubkey,
   );
@@ -105,6 +108,7 @@ export function useReadState(
       seedContextRead: noopMarkRead,
       drainSyncedAdvances: noopDrainAdvances,
       setContextParentResolver: noopSetResolver,
+      setSeatRoster: noopSetSeatRoster,
       readStateVersion: 0,
       getOwnTimestamp: noopGetTimestamp,
     };
@@ -117,6 +121,7 @@ export function useReadState(
     seedContextRead,
     drainSyncedAdvances,
     setContextParentResolver,
+    setSeatRoster,
     readStateVersion,
     getOwnTimestamp,
   };

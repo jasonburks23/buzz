@@ -700,6 +700,81 @@ pub async fn nip44_decrypt_from_self(
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+/// Decrypt a NIP-44 message that a peer (seat) addressed TO the operator.
+///
+/// The seat clerk publishes a copy of its read-state encrypted with
+/// `ECDH(seat_seckey, operator_pubkey)`. The operator legitimately holds their
+/// own secret key on their own machine and can recover the shared secret with
+/// `ECDH(operator_seckey, seat_pubkey)`, where `seat_pubkey` is the event's
+/// author. This is a decrypt of a message addressed to us — not a key-exfil.
+#[tauri::command]
+pub async fn nip44_decrypt_from_peer(
+    ciphertext: String,
+    seat_pubkey_hex: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let keys = state.signing_keys()?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let seat_pubkey = PublicKey::from_hex(seat_pubkey_hex.trim())
+            .map_err(|e| format!("invalid seat pubkey: {e}"))?;
+        nip44::decrypt(keys.secret_key(), &seat_pubkey, &ciphertext)
+            .map_err(|e| format!("nip44 decrypt failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+#[cfg(test)]
+mod nip44_peer_decrypt_tests {
+    use nostr::{nips::nip44, Keys, PublicKey};
+
+    // The operator recovers a message a seat encrypted TO the operator using
+    // ECDH(operator_seckey, seat_pubkey) — the same shared secret the seat
+    // formed with ECDH(seat_seckey, operator_pubkey).
+    #[test]
+    fn operator_decrypts_peer_addressed_message() {
+        let seat = Keys::generate();
+        let operator = Keys::generate();
+
+        // Seat side: encrypt to the operator's pubkey.
+        let ciphertext = nip44::encrypt(
+            seat.secret_key(),
+            &operator.public_key(),
+            "{\"v\":1,\"client_id\":\"abc\",\"contexts\":{}}",
+            nip44::Version::V2,
+        )
+        .expect("seat encrypt to operator");
+
+        // Operator side: decrypt with operator seckey + seat pubkey.
+        let seat_pubkey = PublicKey::from_hex(&seat.public_key().to_hex()).unwrap();
+        let plaintext = nip44::decrypt(operator.secret_key(), &seat_pubkey, &ciphertext)
+            .expect("operator decrypt from peer");
+
+        assert_eq!(plaintext, "{\"v\":1,\"client_id\":\"abc\",\"contexts\":{}}");
+    }
+
+    #[test]
+    fn wrong_seat_pubkey_fails_to_decrypt() {
+        let seat = Keys::generate();
+        let operator = Keys::generate();
+        let imposter = Keys::generate();
+
+        let ciphertext = nip44::encrypt(
+            seat.secret_key(),
+            &operator.public_key(),
+            "hello",
+            nip44::Version::V2,
+        )
+        .expect("encrypt");
+
+        // Decrypting with a DIFFERENT author pubkey yields the wrong shared
+        // secret and must fail (fail-soft in the TS layer).
+        let result = nip44::decrypt(operator.secret_key(), &imposter.public_key(), &ciphertext);
+        assert!(result.is_err());
+    }
+}
+
 #[cfg(test)]
 mod nostr_identity_binding_tests {
     use super::build_nostr_identity_binding_event;

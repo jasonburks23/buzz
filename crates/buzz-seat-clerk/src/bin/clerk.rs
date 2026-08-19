@@ -163,6 +163,19 @@ async fn main() -> Result<()> {
             // Flush read-state if debounce elapsed.
             let now = now_secs();
             if writer.is_flush_due(now) {
+                // Publish operator-addressed copy BEFORE self-addressed copy because
+                // build_event clears pending_contexts on success.
+                match writer.build_operator_event(now, &cfg.keys, cfg.operator_pubkey.as_ref()) {
+                    Ok(Some(op_event)) => {
+                        if let Err(e) = conn.send_event(op_event).await {
+                            warn!("read-state operator publish failed: {e}");
+                        } else {
+                            debug!("read-state operator copy flushed");
+                        }
+                    }
+                    Ok(None) => {} // operator_pubkey not configured; skip.
+                    Err(e) => warn!("read-state operator build failed: {e}"),
+                }
                 match writer.build_event(now, &cfg.keys) {
                     Ok(event) => {
                         if let Err(e) = conn.send_event(event).await {

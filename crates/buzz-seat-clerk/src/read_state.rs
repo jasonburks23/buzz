@@ -230,6 +230,65 @@ impl ReadStateWriter {
         tracing::debug!(slot_id = %self.identity.slot_id, created_at, "read-state event built");
         Ok(event)
     }
+
+    /// Build an operator-readable kind-30078 event for the same pending contexts.
+    ///
+    /// SECURITY PROPERTY: encrypted with ECDH(seat_seckey, operator_pubkey).
+    /// The operator decrypts with ECDH(operator_seckey, seat_pubkey).
+    /// The clerk NEVER holds the operator secret key.
+    ///
+    /// The `d` tag uses suffix `:op` to distinguish from the self-addressed copy.
+    /// Tags: `["d","read-state:<slot>:op"]`, `["t","read-state"]`, `["p","<operator_pubkey_hex>"]`.
+    ///
+    /// Returns `None` if `operator_pubkey` is `None` (feature disabled).
+    ///
+    /// IMPORTANT: call this BEFORE `build_event` because `build_event` clears
+    /// `pending_contexts`.
+    pub fn build_operator_event(
+        &mut self,
+        now_secs: u64,
+        keys: &Keys,
+        operator_pubkey: Option<&nostr::PublicKey>,
+    ) -> Result<Option<Event>, ClerkError> {
+        let Some(op_pubkey) = operator_pubkey else {
+            return Ok(None);
+        };
+
+        let plaintext =
+            build_read_state_plaintext(&self.identity.client_id, &self.pending_contexts)?;
+
+        // SECURITY: encrypt TO the operator's PUBLIC key using the seat's secret key.
+        // ECDH(seat_seckey, operator_pubkey). The operator decrypts with
+        // ECDH(operator_seckey, seat_pubkey). The seat secret key never leaves the clerk.
+        let ciphertext = nostr::nips::nip44::encrypt(
+            keys.secret_key(),
+            op_pubkey,
+            &plaintext,
+            nostr::nips::nip44::Version::V2,
+        )
+        .map_err(|e| ClerkError::Nip44(e.to_string()))?;
+
+        let d_tag_value = format!("read-state:{}:op", self.identity.slot_id);
+        let tags = vec![
+            Tag::parse(vec!["d".to_owned(), d_tag_value])
+                .map_err(|e| ClerkError::ReadStateWrite(e.to_string()))?,
+            Tag::parse(vec!["t".to_owned(), "read-state".to_owned()])
+                .map_err(|e| ClerkError::ReadStateWrite(e.to_string()))?,
+            Tag::parse(vec!["p".to_owned(), op_pubkey.to_hex()])
+                .map_err(|e| ClerkError::ReadStateWrite(e.to_string()))?,
+        ];
+
+        // Use next_created_at for monotonic ordering (same as self-addressed copy).
+        let created_at = self.next_created_at(now_secs);
+
+        let event = EventBuilder::new(Kind::Custom(KIND_READ_STATE as u16), ciphertext)
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .map_err(|e| ClerkError::ReadStateWrite(e.to_string()))?;
+
+        Ok(Some(event))
+    }
 }
 
 // ─── Marker-gated read receipt ────────────────────────────────────────────────
@@ -614,6 +673,122 @@ mod tests {
         let map = parse_read_state_contexts(blob);
         assert_eq!(map.get("good"), Some(&1_700_000_000u64));
         assert!(!map.contains_key("bad"), "non-numeric ts must be skipped");
+    }
+
+    // ── Operator dual-encrypt tests (#383) ──────────────────────────────────
+
+    /// Test A: operator copy present and decryptable.
+    ///
+    /// SECURITY NON-VACUITY: when operator_pubkey is set, build_operator_event
+    /// produces an event whose ciphertext can be decrypted with
+    /// ECDH(operator_seckey, seat_pubkey) and the plaintext matches.
+    #[test]
+    fn operator_copy_present_and_decryptable() {
+        let seat_keys = Keys::generate();
+        let operator_keys = Keys::generate();
+
+        let mut writer = test_writer();
+        writer.mark_read("chan-op".to_string(), 1_720_000_001u64);
+
+        let now = 1_720_000_000u64;
+        let op_event = writer
+            .build_operator_event(now, &seat_keys, Some(&operator_keys.public_key()))
+            .unwrap()
+            .expect("operator copy must be Some when pubkey is provided");
+
+        // Verify tags: d-tag ends with ":op", t-tag = "read-state", p-tag = operator hex.
+        let d_tags: Vec<_> = op_event
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "d")
+            .collect();
+        let t_tags: Vec<_> = op_event
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "t")
+            .collect();
+        let p_tags: Vec<_> = op_event
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "p")
+            .collect();
+
+        assert_eq!(d_tags.len(), 1, "exactly one d-tag");
+        assert!(
+            d_tags[0].content().unwrap_or("").ends_with(":op"),
+            "d-tag must end with :op"
+        );
+        assert_eq!(t_tags[0].content().unwrap_or(""), "read-state");
+        assert_eq!(
+            p_tags[0].content().unwrap_or(""),
+            operator_keys.public_key().to_hex()
+        );
+
+        // Decrypt with operator_seckey + seat_pubkey — this is what the desktop does.
+        let decrypted = nostr::nips::nip44::decrypt(
+            operator_keys.secret_key(),
+            &seat_keys.public_key(),
+            op_event.content.as_str(),
+        )
+        .expect("operator must be able to decrypt with their seckey + seat pubkey");
+
+        let parsed = parse_read_state_contexts(&decrypted);
+        assert_eq!(
+            parsed.get("chan-op"),
+            Some(&1_720_000_001u64),
+            "operator must recover the context timestamp"
+        );
+    }
+
+    /// Test B: mutation sentinel — operator copy absent when pubkey unset.
+    ///
+    /// When operator_pubkey is None, build_operator_event returns Ok(None).
+    /// If the None-guard is removed, this test fails.
+    #[test]
+    fn operator_copy_absent_when_pubkey_unset() {
+        let seat_keys = Keys::generate();
+        let mut writer = test_writer();
+        writer.mark_read("chan-op".to_string(), 1_720_000_001u64);
+
+        let result = writer
+            .build_operator_event(1_720_000_000u64, &seat_keys, None)
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "operator copy must be None when pubkey is not configured"
+        );
+    }
+
+    /// Test C: wrong key cannot decrypt the operator ciphertext.
+    #[test]
+    fn operator_copy_not_decryptable_by_wrong_key() {
+        let seat_keys = Keys::generate();
+        let operator_keys = Keys::generate();
+        let attacker_keys = Keys::generate();
+
+        let mut writer = test_writer();
+        writer.mark_read("chan-sec".to_string(), 1_720_000_002u64);
+
+        let op_event = writer
+            .build_operator_event(
+                1_720_000_000u64,
+                &seat_keys,
+                Some(&operator_keys.public_key()),
+            )
+            .unwrap()
+            .unwrap();
+
+        // An attacker with a random key must NOT be able to decrypt.
+        let result = nostr::nips::nip44::decrypt(
+            attacker_keys.secret_key(),
+            &seat_keys.public_key(),
+            op_event.content.as_str(),
+        );
+        assert!(
+            result.is_err(),
+            "wrong key must not decrypt the operator ciphertext"
+        );
     }
 
     // ── Piece C (unit): NIP-44 round-trip decrypt+parse ─────────────────────
