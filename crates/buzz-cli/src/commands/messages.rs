@@ -627,6 +627,14 @@ fn match_profiles_by_name(events: &[serde_json::Value], name: &str) -> Vec<(Stri
 
 // ─── Session-marker stamp helpers (US-01 / opeff#293) ────────────────────────
 
+/// Compute the lowercase SHA-256 hex digest of `input`.
+fn sha256_hex(input: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(input.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Resolve the live session marker from fleet claim files.
 ///
 /// Scans `claim_dir` (defaults to `/tmp` when `None`) for the freshest
@@ -649,12 +657,19 @@ pub(crate) fn resolve_send_marker(
         .map(|m| m.as_str().to_string())
 }
 
-/// Build the `["session_marker", "<id>"]` Nostr tag for outbound events.
+/// Build the `["session_marker", "<sha256hex>"]` Nostr tag for outbound events.
 ///
-/// Tag shape per D2: multi-char, non-indexed (relays do not filter on it),
-/// raw session-id per D3.
+/// Tag shape per D2: multi-char, non-indexed (relays do not filter on it).
+/// The tag value is sha256_hex(session_id) per D3.
+///
+/// THREAT MODEL (D5): This marker defends against ACCIDENTAL reintroduction of
+/// a fresh-spawn-answers path (for example a buzz-acp style auto-answer), NOT
+/// adversarial forgery. The session id source is readable on the host, so a
+/// malicious process could copy it; the hash adds exposure hygiene, not forgery
+/// resistance. Guard tests assert accidental-fresh-spawn detection only.
 pub(crate) fn build_session_marker_tag(marker_id: &str) -> Result<nostr::Tag, CliError> {
-    nostr::Tag::parse(["session_marker", marker_id])
+    let hashed = sha256_hex(marker_id);
+    nostr::Tag::parse(["session_marker", &hashed])
         .map_err(|e| CliError::Other(format!("session_marker tag build failed: {e}")))
 }
 
@@ -668,6 +683,12 @@ pub(crate) fn build_session_marker_tag(marker_id: &str) -> Result<nostr::Tag, Cl
 ///
 /// D4 contract: if no claim resolves, returns `builder` unchanged (no error,
 /// send is unmarked). This is the detectable fresh-spawn signal.
+///
+/// THREAT MODEL (D5): This marker defends against ACCIDENTAL reintroduction of
+/// a fresh-spawn-answers path (for example a buzz-acp style auto-answer), NOT
+/// adversarial forgery. The session id source is readable on the host, so a
+/// malicious process could copy it; the hash adds exposure hygiene, not forgery
+/// resistance. Guard tests assert accidental-fresh-spawn detection only.
 pub(crate) fn apply_session_marker(
     builder: nostr::EventBuilder,
     claim_dir: Option<&std::path::Path>,
@@ -1612,9 +1633,15 @@ mod tests {
         );
     }
 
-    // ── US-01 / opeff#293: marker-on-send tests ────────────────────────────
+    // ── US-01 / opeff#293: marker-on-send tests ───────────────────────────
+    //
+    // THREAT MODEL (D5): These tests defend against ACCIDENTAL reintroduction of
+    // a fresh-spawn-answers path (for example a buzz-acp style auto-answer), NOT
+    // adversarial forgery. The session id source is readable on the host, so a
+    // malicious process could copy it; the hash adds exposure hygiene, not forgery
+    // resistance. Guard tests assert accidental-fresh-spawn detection only.
 
-    use super::{apply_session_marker, build_session_marker_tag, resolve_send_marker};
+    use super::{apply_session_marker, build_session_marker_tag, resolve_send_marker, sha256_hex};
     use nostr::{EventBuilder, Keys, Kind};
 
     /// Write a claim file so resolve_send_marker can find it.
@@ -1654,6 +1681,7 @@ mod tests {
             "T1: resolved marker must equal the live session id"
         );
 
+        let expected_hash = sha256_hex(live_id);
         let tag = build_session_marker_tag(&marker_id).expect("T1: tag build must succeed");
         let parts = tag.as_slice();
         assert_eq!(
@@ -1663,8 +1691,8 @@ mod tests {
         );
         assert_eq!(
             parts.get(1).map(|s| s.as_str()),
-            Some(live_id),
-            "T1: tag value must be the live session id"
+            Some(expected_hash.as_str()),
+            "T1: tag value must be sha256_hex(live_id)"
         );
 
         // Confirm the tag appears on a signed event.
@@ -1679,8 +1707,8 @@ mod tests {
             tag_values
                 .iter()
                 .any(|t| t.first().map(|s| s.as_str()) == Some("session_marker")
-                    && t.get(1).map(|s| s.as_str()) == Some(live_id)),
-            "T1: signed event must contain session_marker tag with live id"
+                    && t.get(1).map(|s| s.as_str()) == Some(expected_hash.as_str())),
+            "T1: signed event must contain session_marker tag with sha256_hex(live_id)"
         );
     }
 
@@ -1764,6 +1792,8 @@ mod tests {
             "2026-08-19T02:00:00Z",
         );
 
+        let expected_hash = sha256_hex(live_id);
+
         // Channel send path.
         let channel_marker = resolve_send_marker(Some(tmp), "agencyos-cc", Some("/cwd/t4"))
             .expect("T4: channel path must resolve marker");
@@ -1771,8 +1801,8 @@ mod tests {
             build_session_marker_tag(&channel_marker).expect("T4: channel tag build must succeed");
         assert_eq!(
             channel_tag.as_slice().get(1).map(|s| s.as_str()),
-            Some(live_id),
-            "T4: channel marker must be live id"
+            Some(expected_hash.as_str()),
+            "T4: channel marker must be sha256_hex(live_id)"
         );
 
         // Diff (DM) send path -- identical helpers, different builder.
@@ -1782,8 +1812,8 @@ mod tests {
             build_session_marker_tag(&diff_marker).expect("T4: diff tag build must succeed");
         assert_eq!(
             diff_tag.as_slice().get(1).map(|s| s.as_str()),
-            Some(live_id),
-            "T4: diff marker must be live id"
+            Some(expected_hash.as_str()),
+            "T4: diff marker must be sha256_hex(live_id)"
         );
     }
 
@@ -1861,7 +1891,9 @@ mod tests {
             "2026-08-19T03:00:00Z",
         );
 
-        // Positive control: apply_session_marker stamps the live id.
+        let expected_hash = sha256_hex(live_id);
+
+        // Positive control: apply_session_marker stamps the live id (hashed).
         let keys = Keys::generate();
         let base_builder = EventBuilder::new(Kind::TextNote, "live-guarded send");
         let stamped_builder =
@@ -1869,7 +1901,7 @@ mod tests {
                 .expect("T6: apply_session_marker must not error with a live claim");
         let event = stamped_builder.sign_with_keys(&keys).unwrap();
 
-        // The event MUST carry the session_marker tag with the live id.
+        // The event MUST carry the session_marker tag with sha256_hex(live_id).
         // Removing the `.tags(...)` call inside apply_session_marker makes this
         // assertion fail, turning this test RED -- that IS the non-vacuity proof.
         let found_marker = event.tags.iter().find(|t| {
@@ -1883,8 +1915,8 @@ mod tests {
         let marker_val = found_marker.unwrap().as_slice().get(1).map(|s| s.as_str());
         assert_eq!(
             marker_val,
-            Some(live_id),
-            "T6: session_marker value must equal live session id"
+            Some(expected_hash.as_str()),
+            "T6: session_marker value must equal sha256_hex(live_id)"
         );
 
         // Fake-session control: wrong role -> no claim resolves -> unmarked send
@@ -1911,6 +1943,23 @@ mod tests {
         assert!(
             !has_marker,
             "T6: fake session (wrong role) must produce an UNMARKED event"
+        );
+    }
+
+    // T_HASH_PIN - pin the sha256_hex function against a known vector so any
+    // accidental swap of the hash algorithm or encoding turns this RED immediately.
+    #[test]
+    fn t_hash_pin_sha256_hex_known_vector() {
+        // echo -n "hello" | sha256sum
+        // = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(
+            sha256_hex("hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        // Empty string SHA-256 is also a well-known constant.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
 }
