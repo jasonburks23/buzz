@@ -416,6 +416,7 @@ mod tests {
             seat_cwd: None,
             readack_file: String::new(),
             claim_dir: String::new(),
+            operator_pubkey: None,
         };
 
         // Use a concrete body matching the member-filter shape (no raw-string tricks needed).

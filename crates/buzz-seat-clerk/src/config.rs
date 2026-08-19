@@ -4,7 +4,7 @@
 //! `RELAY_URL`: WebSocket URL of the Buzz relay (e.g. `ws://localhost:3000`).
 //! `WAKE_FILE` (optional): path to write the wake signal. Defaults to `/tmp/buzz-seat-clerk.wake`.
 
-use nostr::{FromBech32, Keys, SecretKey};
+use nostr::{FromBech32, Keys, PublicKey, SecretKey};
 
 use crate::error::ClerkError;
 
@@ -25,6 +25,12 @@ pub struct ClerkConfig {
     pub readack_file: String,
     /// Directory containing `claude-seat-claim-*.json` fleet files.
     pub claim_dir: String,
+    /// Operator's public key (hex or bech32 npub). When `Some`, the clerk
+    /// publishes an operator-readable copy of each read-state event so the
+    /// desktop badge can decrypt it with the operator's secret key.
+    ///
+    /// SECURITY: this is a PUBLIC key only. The clerk NEVER holds the operator secret key.
+    pub operator_pubkey: Option<PublicKey>,
 }
 
 impl std::fmt::Debug for ClerkConfig {
@@ -37,6 +43,10 @@ impl std::fmt::Debug for ClerkConfig {
             .field("seat_cwd", &self.seat_cwd)
             .field("readack_file", &self.readack_file)
             .field("claim_dir", &self.claim_dir)
+            .field(
+                "operator_pubkey",
+                &self.operator_pubkey.as_ref().map(|pk| pk.to_hex()),
+            )
             .field("keys", &"<REDACTED>")
             .finish()
     }
@@ -63,6 +73,21 @@ impl ClerkConfig {
             std::env::var("READACK_FILE").unwrap_or_else(|_| "/tmp/buzz-seat-clerk.readack".into());
         let claim_dir = std::env::var("CLAIM_DIR").unwrap_or_else(|_| "/tmp".into());
 
+        let operator_pubkey = if let Ok(raw) = std::env::var("OPERATOR_PUBKEY") {
+            let parsed = PublicKey::from_hex(&raw).or_else(|_| PublicKey::from_bech32(&raw));
+            match parsed {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    tracing::warn!(
+                        "OPERATOR_PUBKEY parse failed ({e}); operator dual-encrypt disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             keys,
             public_key_hex,
@@ -72,6 +97,7 @@ impl ClerkConfig {
             seat_cwd,
             readack_file,
             claim_dir,
+            operator_pubkey,
         })
     }
 }
@@ -161,6 +187,44 @@ mod tests {
         std::env::remove_var("SEAT_CWD");
         std::env::remove_var("READACK_FILE");
         std::env::remove_var("CLAIM_DIR");
+    }
+
+    #[test]
+    fn config_operator_pubkey_parsed_from_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SEAT_NSEC", TEST_NSEC);
+        std::env::set_var("RELAY_URL", "ws://localhost:3000");
+        // Generate a valid hex pubkey from a known secret.
+        let op_keys = nostr::Keys::generate();
+        let op_hex = op_keys.public_key().to_hex();
+        std::env::set_var("OPERATOR_PUBKEY", &op_hex);
+
+        let cfg = ClerkConfig::from_env().unwrap();
+        assert!(
+            cfg.operator_pubkey.is_some(),
+            "operator_pubkey must be Some when OPERATOR_PUBKEY is set to a valid hex pubkey"
+        );
+        assert_eq!(
+            cfg.operator_pubkey.unwrap().to_hex(),
+            op_hex,
+            "operator_pubkey must round-trip the hex value"
+        );
+
+        std::env::remove_var("OPERATOR_PUBKEY");
+    }
+
+    #[test]
+    fn config_operator_pubkey_none_when_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SEAT_NSEC", TEST_NSEC);
+        std::env::set_var("RELAY_URL", "ws://localhost:3000");
+        std::env::remove_var("OPERATOR_PUBKEY");
+
+        let cfg = ClerkConfig::from_env().unwrap();
+        assert!(
+            cfg.operator_pubkey.is_none(),
+            "operator_pubkey must be None when OPERATOR_PUBKEY is not set"
+        );
     }
 
     #[test]

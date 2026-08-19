@@ -486,6 +486,7 @@ async fn read_state_survives_restart_via_relay_load() {
         seat_cwd: None,
         readack_file: dir.path().join("ignored.readack").display().to_string(),
         claim_dir: dir.path().display().to_string(),
+        operator_pubkey: None,
     };
     let relay_http_url = relay_url().replacen("ws://", "http://", 1);
     let http = reqwest::Client::new();
