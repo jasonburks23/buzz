@@ -924,6 +924,10 @@ test("handleOperatorEvent_raisesEffectiveTimestamp_endToEnd", async () => {
   const channelId = "channel-op-1";
   assert.equal(mgr.getEffectiveTimestamp(channelId), null);
 
+  // The operator-event author must be in the seat roster for the guard to pass.
+  const seatPubkey = "b".repeat(64);
+  mgr.setSeatRoster([seatPubkey]);
+
   // Override the private seam to inject a stub parse into the REAL free
   // mergeOperatorEvent, so the real max-merge line under test runs.
   const withContexts = (contexts, createdAt) => {
@@ -940,7 +944,7 @@ test("handleOperatorEvent_raisesEffectiveTimestamp_endToEnd", async () => {
         }),
       });
   };
-  const opEvent = { id: "1".repeat(64), pubkey: "b".repeat(64), content: "ct" };
+  const opEvent = { id: "1".repeat(64), pubkey: seatPubkey, content: "ct" };
 
   withContexts({ [channelId]: 5_000 }, 4_000);
   await mgr.handleOperatorEvent(opEvent);
@@ -1045,6 +1049,89 @@ test("setSeatRoster_excludesSelf_andSubscribesRosterAuthors", async () => {
   );
   assert.deepEqual(capturedFilter["#t"], ["read-state"]);
   assert.deepEqual(capturedFilter.kinds, [30078]);
+
+  mgr.destroy();
+});
+
+// ── #383 follow-up: roster-membership guard on handleOperatorEvent ────────────
+
+// A relay could return a kind-30078 from an author NOT in the seat roster.
+// The client must DISCARD such events before merge so a rogue relay cannot
+// advance the operator's read cursor and hide real unread notifications.
+test("non_roster_author_operator_event_is_discarded", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+  const operatorPubkey = "a".repeat(64);
+  const seatA = "b".repeat(64);
+  const seatB = "c".repeat(64); // NOT in roster
+  const mgr = new ReadStateManager(operatorPubkey, makeFakeRelay());
+  const channelId = "channel-roster-guard-1";
+
+  // Set the roster to only seatA.
+  mgr.setSeatRoster([seatA]);
+
+  // Stub mergeOperatorEvent so the pure merge would advance the channel if
+  // the guard does not fire.
+  mgr.mergeOperatorEvent = (event) =>
+    mergeOperatorEvent({
+      event,
+      operatorPubkey: mgr.pubkey,
+      effectiveState: mgr.effectiveState,
+      contextSourceCreatedAt: mgr.contextSourceCreatedAt,
+      parse: async () => ({
+        dTag: "read-state:slot:op",
+        blob: { v: 1, client_id: "seat", contexts: { [channelId]: 9_000 } },
+        createdAt: 5_000,
+      }),
+    });
+
+  // Feed handleOperatorEvent an event from seatB (not in roster).
+  const rogueEvent = { id: "2".repeat(64), pubkey: seatB, content: "ct" };
+  await mgr.handleOperatorEvent(rogueEvent);
+
+  assert.equal(
+    mgr.getEffectiveTimestamp(channelId),
+    null,
+    "non-roster author event must be discarded; effective timestamp must remain null",
+  );
+
+  mgr.destroy();
+});
+
+// A roster-member's operator-addressed copy MUST still be merged normally.
+// This proves the guard does not over-block legitimate seat events.
+test("roster_author_operator_event_is_merged", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+  const operatorPubkey = "a".repeat(64);
+  const seatA = "b".repeat(64); // IS in roster
+  const mgr = new ReadStateManager(operatorPubkey, makeFakeRelay());
+  const channelId = "channel-roster-guard-2";
+
+  // Set the roster to seatA.
+  mgr.setSeatRoster([seatA]);
+
+  // Stub mergeOperatorEvent the same way as the discard test.
+  mgr.mergeOperatorEvent = (event) =>
+    mergeOperatorEvent({
+      event,
+      operatorPubkey: mgr.pubkey,
+      effectiveState: mgr.effectiveState,
+      contextSourceCreatedAt: mgr.contextSourceCreatedAt,
+      parse: async () => ({
+        dTag: "read-state:slot:op",
+        blob: { v: 1, client_id: "seat", contexts: { [channelId]: 9_000 } },
+        createdAt: 5_000,
+      }),
+    });
+
+  // Feed handleOperatorEvent an event from seatA (in roster).
+  const validEvent = { id: "3".repeat(64), pubkey: seatA, content: "ct" };
+  await mgr.handleOperatorEvent(validEvent);
+
+  assert.equal(
+    mgr.getEffectiveTimestamp(channelId),
+    9_000,
+    "roster-member author event must be merged and raise the effective timestamp",
+  );
 
   mgr.destroy();
 });
