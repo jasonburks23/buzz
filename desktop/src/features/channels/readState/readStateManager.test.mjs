@@ -3,11 +3,14 @@ import test from "node:test";
 
 import {
   ReadStateManager,
-  applyRemoteContextTimestamp,
-  resolveEffectiveTimestamp,
   splitContextsIntoBudgetedSlots,
   trimContextsToBudget,
 } from "./readStateManager.ts";
+import {
+  applyRemoteContextTimestamp,
+  resolveEffectiveTimestamp,
+} from "./readStateMerge.ts";
+import { mergeOperatorEvent } from "./readStateOperatorMerge.ts";
 
 // ── ReadStateManager integration helpers ─────────────────────────────────────
 // Provide browser globals required by ReadStateManager (localStorage,
@@ -906,6 +909,142 @@ test("rememberPublishedId_evictsOldestBeyondCap", () => {
   assert.equal(ids.size, 64, "set must be capped");
   assert.ok(!ids.has("id-0"), "oldest id must be evicted");
   assert.ok(ids.has(`id-${total - 1}`), "newest id must be retained");
+
+  mgr.destroy();
+});
+
+// ── #383 operator-copy integration: handleOperatorEvent raises the badge ──────
+
+// End-to-end through the manager: a seat's operator-addressed copy must raise
+// effective(channel) so the badge drops. The parse+decrypt (Tauri) is injected
+// via the mergeOperatorEvent seam's `parse` arg so the test stays pure.
+test("handleOperatorEvent_raisesEffectiveTimestamp_endToEnd", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+  const mgr = new ReadStateManager("a".repeat(64), makeFakeRelay());
+  const channelId = "channel-op-1";
+  assert.equal(mgr.getEffectiveTimestamp(channelId), null);
+
+  // Override the private seam to inject a stub parse into the REAL free
+  // mergeOperatorEvent, so the real max-merge line under test runs.
+  const withContexts = (contexts, createdAt) => {
+    mgr.mergeOperatorEvent = (event) =>
+      mergeOperatorEvent({
+        event,
+        operatorPubkey: mgr.pubkey,
+        effectiveState: mgr.effectiveState,
+        contextSourceCreatedAt: mgr.contextSourceCreatedAt,
+        parse: async () => ({
+          dTag: "read-state:slot:op",
+          blob: { v: 1, client_id: "seat", contexts },
+          createdAt,
+        }),
+      });
+  };
+  const opEvent = { id: "1".repeat(64), pubkey: "b".repeat(64), content: "ct" };
+
+  withContexts({ [channelId]: 5_000 }, 4_000);
+  await mgr.handleOperatorEvent(opEvent);
+  assert.equal(
+    mgr.getEffectiveTimestamp(channelId),
+    5_000,
+    "operator-copy watermark must raise the effective timestamp",
+  );
+
+  withContexts({ [channelId]: 3_000 }, 6_000);
+  await mgr.handleOperatorEvent(opEvent);
+  assert.equal(
+    mgr.getEffectiveTimestamp(channelId),
+    5_000,
+    "a lower operator-copy watermark must NOT lower the higher existing one",
+  );
+
+  mgr.destroy();
+});
+
+// ── #383 mergeOperatorEvent (pure): max-merge into effectiveState ─────────────
+
+// The load-bearing merge. A parsed :op copy raises effective(ctx); a lower
+// watermark never lowers a higher one. Parse is injected so this is pure.
+test("mergeOperatorEvent_maxMergesContextsIntoEffectiveState", async () => {
+  const effectiveState = new Map();
+  const contextSourceCreatedAt = new Map();
+  const base = {
+    event: { id: "x", pubkey: "b".repeat(64), content: "ct" },
+    operatorPubkey: "a".repeat(64),
+    effectiveState,
+    contextSourceCreatedAt,
+  };
+
+  // Raise to 5000.
+  const r1 = await mergeOperatorEvent({
+    ...base,
+    parse: async () => ({
+      dTag: "read-state:s:op",
+      blob: { v: 1, client_id: "seat", contexts: { "chan-1": 5_000 } },
+      createdAt: 4_000,
+    }),
+  });
+  assert.deepEqual(r1?.advanced, ["chan-1"]);
+  assert.equal(effectiveState.get("chan-1"), 5_000);
+
+  // A lower watermark must not lower the higher existing value.
+  const r2 = await mergeOperatorEvent({
+    ...base,
+    parse: async () => ({
+      dTag: "read-state:s:op",
+      blob: { v: 1, client_id: "seat", contexts: { "chan-1": 3_000 } },
+      createdAt: 6_000,
+    }),
+  });
+  assert.deepEqual(r2?.advanced, [], "lower watermark advances nothing");
+  assert.equal(
+    effectiveState.get("chan-1"),
+    5_000,
+    "max-merge holds the higher",
+  );
+
+  // A non-:op / undecryptable event parses to null → returns null, no merge.
+  const r3 = await mergeOperatorEvent({ ...base, parse: async () => null });
+  assert.equal(r3, null, "unparseable event yields null");
+});
+
+// ── #383 roster exclusion: the operator's own pubkey is not a seat author ─────
+test("setSeatRoster_excludesSelf_andSubscribesRosterAuthors", async () => {
+  globalThis.window.localStorage = makeLocalStorage();
+
+  const self = "a".repeat(64);
+  const seat1 = "b".repeat(64);
+  const seat2 = "c".repeat(64);
+
+  let capturedFilter = null;
+  const relay = {
+    fetchEvents: async () => [],
+    publishEvent: async () => {},
+    subscribeLive: (filter) => {
+      // The manager runs BOTH the self subscription (authors=[self]) and the
+      // operator subscription (authors=roster). Capture only the roster one.
+      if (!filter.authors?.includes(self)) capturedFilter = filter;
+      return () => {};
+    },
+  };
+  const mgr = new ReadStateManager(self, relay);
+
+  // Pass a roster that INCLUDES self plus a duplicate seat.
+  mgr.setSeatRoster([seat1, self, seat2, seat1]);
+  // setSeatRoster kicks off an async subscribeLive; let it settle.
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.ok(capturedFilter, "operator subscription must have been created");
+  const authors = capturedFilter.authors ?? [];
+  assert.ok(!authors.includes(self), "operator's own pubkey must be excluded");
+  assert.deepEqual(
+    [...authors].sort(),
+    [seat1, seat2].sort(),
+    "roster authors must be the deduped non-self seat pubkeys",
+  );
+  assert.deepEqual(capturedFilter["#t"], ["read-state"]);
+  assert.deepEqual(capturedFilter.kinds, [30078]);
 
   mgr.destroy();
 });

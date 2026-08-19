@@ -14,6 +14,17 @@ import {
 } from "@/features/channels/readState/readStateFormat";
 import { parseReadStateEvent } from "@/features/channels/readState/readStateSnapshot";
 import {
+  applyRemoteContextTimestamp,
+  resolveEffectiveTimestamp,
+  type ContextParentResolver,
+} from "@/features/channels/readState/readStateMerge";
+import {
+  mergeOperatorEvent,
+  normalizeSeatRoster,
+  operatorSubscriptionFilter,
+  seatRostersEqual,
+} from "@/features/channels/readState/readStateOperatorMerge";
+import {
   clientIdKey,
   generateHex,
   getOrCreatePersisted,
@@ -34,79 +45,6 @@ const LOCAL_PERSIST_MAX_WAIT_MS = 1_000;
  * subscription can drop their relay echoes before the nip44 decrypt. A
  * publish cycle emits at most a handful of slot events; 64 is generous. */
 const PUBLISHED_ID_MEMORY = 64;
-
-export type ApplyRemoteContextResult = "unchanged" | "advanced";
-
-export type ContextParentResolver = (contextId: string) => string | null;
-
-/**
- * NIP-RS Hierarchical Frontier Rule (NIP-RS.md:141-167):
- * `effective(ctx) = max(merged[ctx], effective(parent(ctx)))`.
- *
- * The thread→channel relationship is NOT serialized into the blob
- * (NIP-RS.md:136-139); it is derived from the event graph at evaluation time
- * via `parentResolver`. When the resolver yields no parent (channels, or an
- * unresolvable thread root), the frontier degrades to the context's own merged
- * value alone (NIP-RS.md:165-167). Returns null when the context has never been
- * read and no parent term covers it.
- */
-export function resolveEffectiveTimestamp(args: {
-  effectiveState: Map<string, number>;
-  contextId: string;
-  parentResolver: ContextParentResolver | null;
-}): number | null {
-  const { effectiveState, contextId, parentResolver } = args;
-  const own = effectiveState.get(contextId) ?? null;
-
-  const parentId = parentResolver?.(contextId) ?? null;
-  if (parentId === null) return own;
-
-  const parent = effectiveState.get(parentId) ?? null;
-  if (parent === null) return own;
-  if (own === null) return parent;
-  return Math.max(own, parent);
-}
-
-function resolveRemoteContextTimestamp(args: {
-  current: number;
-  timestamp: number;
-}): { next: number; result: ApplyRemoteContextResult } {
-  const next = Math.max(args.current, args.timestamp);
-  return {
-    next,
-    result: next === args.current ? "unchanged" : "advanced",
-  };
-}
-
-export function applyRemoteContextTimestamp(args: {
-  effectiveState: Map<string, number>;
-  contextSourceCreatedAt: Map<string, number>;
-  contextId: string;
-  timestamp: number;
-  eventCreatedAt: number;
-}): ApplyRemoteContextResult {
-  const {
-    effectiveState,
-    contextSourceCreatedAt,
-    contextId,
-    timestamp,
-    eventCreatedAt,
-  } = args;
-  const sourceCreatedAt = contextSourceCreatedAt.get(contextId) ?? 0;
-  const current = effectiveState.get(contextId) ?? 0;
-  const { next, result } = resolveRemoteContextTimestamp({
-    current,
-    timestamp,
-  });
-
-  if (result === "advanced") {
-    effectiveState.set(contextId, next);
-  }
-  if (eventCreatedAt > sourceCreatedAt) {
-    contextSourceCreatedAt.set(contextId, eventCreatedAt);
-  }
-  return result;
-}
 
 /**
  * Result of a `splitContextsIntoBudgetedSlots` call.
@@ -281,6 +219,10 @@ export class ReadStateManager {
   private localPersistTimer: number | null = null;
   private listeners = new Set<() => void>();
   private unsubscribeLive: (() => void) | null = null;
+  /** #383 operator-copy subscription over the seat roster (separate handle). */
+  private unsubscribeOperatorLive: (() => void) | null = null;
+  /** Deduped, self-excluded seat pubkeys feeding the badge (#383). */
+  private seatRoster: string[] = [];
   private initialized = false;
   private maxFetchedCreatedAt = 0;
   private contextSourceCreatedAt = new Map<string, number>();
@@ -401,6 +343,64 @@ export class ReadStateManager {
     this.parentResolver = resolver;
   }
 
+  /** Update the seat roster whose operator-addressed copies feed the badge
+   * (#383); deduped + self-dropped, restarts the sub on change. */
+  setSeatRoster(pubkeys: string[]): void {
+    if (this.destroyed) return;
+    const next = normalizeSeatRoster(pubkeys, this.pubkey);
+    if (seatRostersEqual(next, this.seatRoster)) return;
+    this.seatRoster = next;
+    void this.restartOperatorSubscription();
+  }
+
+  private async restartOperatorSubscription(): Promise<void> {
+    if (this.unsubscribeOperatorLive) {
+      void this.unsubscribeOperatorLive();
+      this.unsubscribeOperatorLive = null;
+    }
+    if (this.destroyed || this.seatRoster.length === 0) return;
+    try {
+      const unsub = await this.relayClient.subscribeLive(
+        operatorSubscriptionFilter(this.seatRoster),
+        (event: RelayEvent) => {
+          void this.handleOperatorEvent(event);
+        },
+      );
+      if (this.destroyed) {
+        unsub();
+        return;
+      }
+      this.unsubscribeOperatorLive = unsub;
+    } catch (error) {
+      // Non-fatal: the self subscription still drives the badge.
+      console.debug("[ReadStateManager] operator subscription FAILED:", error);
+    }
+  }
+
+  /** Route a seat's operator-addressed copy into effectiveState, max-merged. */
+  private async handleOperatorEvent(event: RelayEvent): Promise<void> {
+    if (this.destroyed) return;
+    const merged = await this.mergeOperatorEvent(event);
+    if (!merged || this.destroyed) return;
+    const { advanced, createdAt } = merged;
+    this.maxFetchedCreatedAt = Math.max(this.maxFetchedCreatedAt, createdAt);
+    if (advanced.length > 0) {
+      for (const ctx of advanced) this.pendingSyncedAdvances.add(ctx);
+      this.persistLocalState();
+      this.notifyListeners();
+    }
+  }
+
+  /** Test seam over the pure mergeOperatorEvent. */
+  private mergeOperatorEvent(event: RelayEvent) {
+    return mergeOperatorEvent({
+      event,
+      operatorPubkey: this.pubkey,
+      effectiveState: this.effectiveState,
+      contextSourceCreatedAt: this.contextSourceCreatedAt,
+    });
+  }
+
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => {
@@ -424,10 +424,11 @@ export class ReadStateManager {
       void this.publish();
     }
 
-    if (this.unsubscribeLive) {
-      void this.unsubscribeLive();
-      this.unsubscribeLive = null;
+    for (const unsub of [this.unsubscribeLive, this.unsubscribeOperatorLive]) {
+      if (unsub) void unsub();
     }
+    this.unsubscribeLive = null;
+    this.unsubscribeOperatorLive = null;
 
     this.listeners.clear();
   }

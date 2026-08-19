@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { ForcedUnreadSource } from "@/features/channels/forcedUnreadStore";
-import type { ContextParentResolver } from "@/features/channels/readState/readStateManager";
+import type { ContextParentResolver } from "@/features/channels/readState/readStateMerge";
 import type { ThreadActivityItem } from "@/features/channels/useUnreadChannels";
 import type { FeedItemState } from "@/features/home/useFeedItemState";
 import type { FeedItem } from "@/shared/api/types";

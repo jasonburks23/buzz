@@ -16,6 +16,7 @@ import {
   type ObservedUnreadEvent,
 } from "@/features/channels/unreadChannelCounts";
 import { useReadState } from "@/features/channels/readState/useReadState";
+import { useSeatRoster } from "@/features/channels/readState/useSeatRoster";
 import { makeRootIdStore } from "@/features/channels/unreadRootIdStore";
 import {
   forcedUnreadStore,
@@ -152,9 +153,13 @@ export function useUnreadChannels(
     markContextRead,
     drainSyncedAdvances,
     setContextParentResolver,
+    setSeatRoster,
     readStateVersion,
     getOwnTimestamp,
   } = useReadState(pubkey, relayClient);
+
+  // #383: push the seat roster into the manager for operator-copy merge.
+  useSeatRoster(channels, isReadStateReady, setSeatRoster);
 
   // Per-channel latest observed external trigger timestamp (unix seconds) and
   // per-event metadata. Derived relay evidence, not source-of-truth; the unread
