@@ -658,6 +658,29 @@ pub(crate) fn build_session_marker_tag(marker_id: &str) -> Result<nostr::Tag, Cl
         .map_err(|e| CliError::Other(format!("session_marker tag build failed: {e}")))
 }
 
+/// Stamp the live session marker onto `builder` if a claim resolves (D4).
+///
+/// This is THE wiring function for US-01 / opeff#293. Both cmd_send_message
+/// and cmd_send_diff_message call it so the stamp is applied identically on
+/// every outbound Nostr event. Tests for the non-vacuity guard (T6) call this
+/// function directly, so removing the `.tags(...)` line inside this function
+/// turns T6 RED -- that is the g1 non-vacuity proof.
+///
+/// D4 contract: if no claim resolves, returns `builder` unchanged (no error,
+/// send is unmarked). This is the detectable fresh-spawn signal.
+pub(crate) fn apply_session_marker(
+    builder: nostr::EventBuilder,
+    claim_dir: Option<&std::path::Path>,
+    role: &str,
+    cwd: Option<&str>,
+) -> Result<nostr::EventBuilder, CliError> {
+    if let Some(marker_id) = resolve_send_marker(claim_dir, role, cwd) {
+        Ok(builder.tags([build_session_marker_tag(&marker_id)?]))
+    } else {
+        Ok(builder)
+    }
+}
+
 pub struct SendMessageParams {
     pub channel_id: String,
     pub content: String,
@@ -774,11 +797,10 @@ pub async fn cmd_send_message(
         }
     };
 
-    // US-01 / opeff#293: stamp the live session marker as a session_marker tag.
-    // Resolves using the same resolver (resolve_live_marker_from_claims) as the
-    // read guard. If no marker resolves (fresh spawn / no claim), the send is
-    // left UNMARKED -- do not fail (D4: fail-open-unmarked).
-    let builder = if let Some(marker_id) = resolve_send_marker(
+    // US-01 / opeff#293: stamp the live session marker via apply_session_marker.
+    // D4: if no claim resolves, builder is returned unchanged (unmarked, no error).
+    let builder = apply_session_marker(
+        builder,
         None,
         &std::env::var("TP_ROLE").unwrap_or_default(),
         Some(
@@ -786,11 +808,7 @@ pub async fn cmd_send_message(
                 .or_else(|_| std::fs::canonicalize(".").map(|p| p.display().to_string()))
                 .unwrap_or_default(),
         ),
-    ) {
-        builder.tags([build_session_marker_tag(&marker_id)?])
-    } else {
-        builder
-    };
+    )?;
 
     let event = client.sign_event(builder)?;
     let emitted_mentions = event_mention_pubkeys(&event);
@@ -889,7 +907,8 @@ pub async fn cmd_send_diff_message(client: &BuzzClient, p: SendDiffParams) -> Re
             .map_err(|e| CliError::Other(format!("build_diff_message failed: {e}")))?;
 
     // US-01 / opeff#293: stamp the live session marker on diff sends too (D4).
-    let builder = if let Some(marker_id) = resolve_send_marker(
+    let builder = apply_session_marker(
+        builder,
         None,
         &std::env::var("TP_ROLE").unwrap_or_default(),
         Some(
@@ -897,11 +916,7 @@ pub async fn cmd_send_diff_message(client: &BuzzClient, p: SendDiffParams) -> Re
                 .or_else(|_| std::fs::canonicalize(".").map(|p| p.display().to_string()))
                 .unwrap_or_default(),
         ),
-    ) {
-        builder.tags([build_session_marker_tag(&marker_id)?])
-    } else {
-        builder
-    };
+    )?;
 
     let event = client.sign_event(builder)?;
 
@@ -1599,7 +1614,7 @@ mod tests {
 
     // ── US-01 / opeff#293: marker-on-send tests ────────────────────────────
 
-    use super::{build_session_marker_tag, resolve_send_marker};
+    use super::{apply_session_marker, build_session_marker_tag, resolve_send_marker};
     use nostr::{EventBuilder, Keys, Kind};
 
     /// Write a claim file so resolve_send_marker can find it.
@@ -1821,11 +1836,16 @@ mod tests {
         );
     }
 
-    // T6 - non-vacuity guard (g1 bar): live-session send stamps the marker
-    // (positive control); when stamp wiring is removed, this test MUST go RED.
-    // This test directly checks that resolve_send_marker + tag wiring produces
-    // the marker when a claim exists (stamp wiring present = GREEN),
-    // and asserts the tag is in the event (so removing the wiring = no tag = RED).
+    // T6 - non-vacuity guard (g1 bar): apply_session_marker (the ACTUAL wiring
+    // function called by cmd_send_message and cmd_send_diff_message) stamps the
+    // marker when a live claim resolves, and leaves the builder unmarked when no
+    // claim exists (D4: fail-open-unmarked).
+    //
+    // Non-vacuity: this test calls apply_session_marker directly. Removing the
+    // `.tags(...)` line inside apply_session_marker turns this test RED because
+    // the event will have no session_marker tag. Restoring it turns it GREEN.
+    // Both production paths call apply_session_marker, so the guard is load-bearing
+    // on the real send path.
     #[test]
     fn t6_non_vacuity_guard_live_session_stamped_fake_not() {
         let dir = tempdir().unwrap();
@@ -1841,41 +1861,35 @@ mod tests {
             "2026-08-19T03:00:00Z",
         );
 
-        // Positive control: live session claim resolves and stamp is applied.
-        let marker_id = resolve_send_marker(Some(tmp), "agencyos-cc", Some("/cwd/t6"))
-            .expect("T6: live claim must resolve");
-        assert_eq!(
-            marker_id, live_id,
-            "T6: resolved marker must be live id, not fake"
-        );
-        assert_ne!(marker_id, fake_id, "T6: marker must not be the fake id");
-
-        // Build and sign the event WITH the stamp wired.
-        let tag = build_session_marker_tag(&marker_id).expect("T6: tag build must succeed");
+        // Positive control: apply_session_marker stamps the live id.
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::TextNote, "live-guarded send")
-            .tags([tag])
-            .sign_with_keys(&keys)
-            .unwrap();
+        let base_builder = EventBuilder::new(Kind::TextNote, "live-guarded send");
+        let stamped_builder =
+            apply_session_marker(base_builder, Some(tmp), "agencyos-cc", Some("/cwd/t6"))
+                .expect("T6: apply_session_marker must not error with a live claim");
+        let event = stamped_builder.sign_with_keys(&keys).unwrap();
 
         // The event MUST carry the session_marker tag with the live id.
-        // If stamp wiring is removed (no .tags([marker_tag]) call), this assertion
-        // will fail, turning this test RED -- that is the non-vacuity proof.
+        // Removing the `.tags(...)` call inside apply_session_marker makes this
+        // assertion fail, turning this test RED -- that IS the non-vacuity proof.
         let found_marker = event.tags.iter().find(|t| {
             let parts = t.as_slice();
             parts.first().map(|s| s.as_str()) == Some("session_marker")
         });
-        assert!(found_marker.is_some(), "T6: event must have session_marker tag (non-vacuity: removing stamp wiring turns this RED)");
+        assert!(
+            found_marker.is_some(),
+            "T6: event must have session_marker tag (non-vacuity: removing wiring in apply_session_marker turns this RED)"
+        );
         let marker_val = found_marker.unwrap().as_slice().get(1).map(|s| s.as_str());
         assert_eq!(
             marker_val,
             Some(live_id),
-            "T6: marker tag must equal live session id"
+            "T6: session_marker value must equal live session id"
         );
 
-        // Fake-session control: no claim file for fake role -> no stamp.
+        // Fake-session control: wrong role -> no claim resolves -> unmarked send
+        // (D4: no error, no tag).
         let fake_dir = tempdir().unwrap();
-        // Write a claim for a DIFFERENT role so the fake role gets no match.
         write_claim_file(
             fake_dir.path(),
             fake_id,
@@ -1883,11 +1897,20 @@ mod tests {
             "/cwd/t6",
             "2026-08-19T03:00:00Z",
         );
-        let fake_marker =
-            resolve_send_marker(Some(fake_dir.path()), "agencyos-cc", Some("/cwd/t6"));
+        let base2 = EventBuilder::new(Kind::TextNote, "fake-spawn send");
+        let unmarked_builder =
+            apply_session_marker(base2, Some(fake_dir.path()), "agencyos-cc", Some("/cwd/t6"))
+                .expect("T6: D4 - apply_session_marker must not error when no claim resolves");
+        let unmarked_event = unmarked_builder.sign_with_keys(&keys).unwrap();
+        let has_marker = unmarked_event.tags.iter().any(|t| {
+            t.as_slice()
+                .first()
+                .map(|s| s.as_str())
+                .is_some_and(|name| name == "session_marker")
+        });
         assert!(
-            fake_marker.is_none(),
-            "T6: fake session (wrong role) must not stamp a marker"
+            !has_marker,
+            "T6: fake session (wrong role) must produce an UNMARKED event"
         );
     }
 }
