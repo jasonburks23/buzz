@@ -275,11 +275,18 @@ async fn main() -> Result<()> {
                             channel_uuid,
                         );
 
-                        // On a Lane-1 wake, also write the unread-summary sidecar.
-                        // This lets the woken session read one file and open exactly
-                        // the right rooms without sweeping every channel.
+                        // On a Lane-1 wake, also write the unread-summary sidecar
+                        // and overwrite the wake file with the v1 rich JSON format
+                        // that buzz-bridge.ts expects: {"v":1,"channels":{<uuid>:<ts>,...}}.
                         if lane == Lane::ForMe {
                             emitter.emit_badge_sidecar(
+                                event.created_at.as_secs(),
+                                &mailbox,
+                                &writer,
+                                &channels,
+                                &cfg.public_key_hex,
+                            );
+                            emitter.emit_rich(
                                 event.created_at.as_secs(),
                                 &mailbox,
                                 &writer,

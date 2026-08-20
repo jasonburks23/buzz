@@ -1,8 +1,8 @@
 //! Wake signal emitter.
 //!
-//! On Lane-1 (ForMe) events, writes `<unix_secs>\n` to a configured file.
-//! The supervisor (launchd / Hermes-later) watches this file via `WatchPaths`.
-//! Lane-2/3 (Delivery) events do NOT trigger a write.
+//! On Lane-1 (ForMe) events, writes a rich JSON wake object to a configured file.
+//! The MCP bridge (buzz-bridge.ts) watches this file and expects the shape:
+//!   `{"v":1,"channels":{"<uuid>":<unix_secs>,...}}`
 //!
 //! Also writes a `<wake_file>.rooms` sidecar JSON (per-channel unread summary)
 //! immediately after each Lane-1 wake so the woken session can open the right
@@ -16,7 +16,7 @@ use std::fs;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::badge::per_channel_badges;
+use crate::badge::{per_channel_badges, ChannelBadge};
 use crate::discovery::ChannelInfo;
 use crate::error::ClerkError;
 use crate::lane::Lane;
@@ -44,6 +44,57 @@ impl WakeEmitter {
             self.emit(unix_secs)?;
         }
         Ok(())
+    }
+
+    /// Write the rich v1 wake JSON that buzz-bridge.ts expects.
+    ///
+    /// Shape: `{"v":1,"channels":{"<channel-uuid>":<unix_secs>,...}}`
+    ///
+    /// Only channels with `total_unread > 0` are included (they are the same
+    /// channels that `emit_badge_sidecar` writes to the `.rooms` sidecar).
+    /// If no channels have unread mail, writes `{"v":1,"channels":{}}` which
+    /// the bridge treats as no pending wakes.
+    ///
+    /// On serialize or IO error the error is logged and the method returns
+    /// without propagating so a wake write failure never kills the clerk.
+    pub fn emit_rich(
+        &self,
+        unix_secs: u64,
+        mailbox: &Mailbox,
+        read_state: &ReadStateWriter,
+        channels: &HashMap<Uuid, ChannelInfo>,
+        seat_pubkey_hex: &str,
+    ) {
+        let badges = per_channel_badges(mailbox, read_state, channels, seat_pubkey_hex);
+        self.emit_rich_from_badges(unix_secs, &badges);
+    }
+
+    /// Inner helper: build and write the v1 JSON from an already-computed badge slice.
+    fn emit_rich_from_badges(&self, unix_secs: u64, badges: &[ChannelBadge]) {
+        // Build the channels map: key = channel UUID string, value = wake timestamp.
+        // Include all channels present in the badges list (each has total_unread > 0
+        // by construction from per_channel_badges).
+        let channels_map: serde_json::Map<String, serde_json::Value> = badges
+            .iter()
+            .map(|b| (b.channel_id.to_string(), serde_json::Value::from(unix_secs)))
+            .collect();
+
+        let payload = serde_json::json!({
+            "v": 1u64,
+            "channels": channels_map,
+        });
+
+        let json = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("rich wake serialize failed: {e}");
+                return;
+            }
+        };
+
+        if let Err(e) = fs::write(&self.wake_file_path, &json) {
+            warn!("rich wake write failed: {e}");
+        }
     }
 
     /// Write a `<wake_file>.rooms` sidecar JSON with per-channel unread counts.
@@ -314,6 +365,123 @@ mod tests {
         assert!(
             chans[0]["badge_unread"].as_u64().unwrap_or(0) > 0,
             "first channel in sidecar must have badge_unread > 0"
+        );
+    }
+
+    // emit_rich writes a v1 JSON object that buzz-bridge.ts can parse.
+    // Asserts: file contains valid JSON with v=1 and channels as an object,
+    // each key is a channel UUID string and each value is the unix timestamp.
+    #[test]
+    fn emit_rich_writes_v1_wake_json() {
+        use crate::discovery::ChannelType;
+
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+        const AS_OF: u64 = 1_700_000_000;
+
+        let dir = tempdir().unwrap();
+        let wake_path = dir.path().join("wake");
+        let emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
+
+        let ch1 = Uuid::new_v4();
+        let ch2 = Uuid::new_v4();
+
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(
+            ch1,
+            ChannelInfo {
+                uuid: ch1,
+                name: "dm-room".to_string(),
+                channel_type: ChannelType::Dm,
+            },
+        );
+        channels.insert(
+            ch2,
+            ChannelInfo {
+                uuid: ch2,
+                name: "team-chat".to_string(),
+                channel_type: ChannelType::Stream,
+            },
+        );
+
+        let mut mailbox = Mailbox::new();
+        mailbox.insert(ch1, dm_entry("e1", 100, ch1, OTHER_PK));
+        mailbox.insert(ch2, dm_entry("e2", 100, ch2, OTHER_PK));
+
+        let writer = test_writer();
+
+        emitter.emit_rich(AS_OF, &mailbox, &writer, &channels, SEAT_PK);
+
+        assert!(wake_path.exists(), "wake file must be written by emit_rich");
+
+        let raw = std::fs::read_to_string(&wake_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("emit_rich must produce valid JSON");
+
+        // v must be 1 (bridge checks raw.v !== 1 and returns null otherwise).
+        assert_eq!(parsed["v"].as_u64(), Some(1), "wake file must have v=1");
+
+        // channels must be an object (bridge checks typeof raw.channels !== "object").
+        let chans = parsed["channels"]
+            .as_object()
+            .expect("channels must be a JSON object");
+
+        // Both channel UUIDs must appear as keys.
+        let ch1_str = ch1.to_string();
+        let ch2_str = ch2.to_string();
+        assert!(
+            chans.contains_key(&ch1_str),
+            "ch1 UUID must be a key in channels"
+        );
+        assert!(
+            chans.contains_key(&ch2_str),
+            "ch2 UUID must be a key in channels"
+        );
+
+        // Each value must be the unix timestamp.
+        assert_eq!(
+            chans[&ch1_str].as_u64(),
+            Some(AS_OF),
+            "ch1 wake timestamp must equal AS_OF"
+        );
+        assert_eq!(
+            chans[&ch2_str].as_u64(),
+            Some(AS_OF),
+            "ch2 wake timestamp must equal AS_OF"
+        );
+
+        // No extra keys.
+        assert_eq!(
+            chans.len(),
+            2,
+            "channels must contain exactly the two unread badges"
+        );
+    }
+
+    // emit_rich with no unread messages writes {"v":1,"channels":{}} (no pending wakes).
+    #[test]
+    fn emit_rich_empty_mailbox_writes_empty_channels() {
+        let dir = tempdir().unwrap();
+        let wake_path = dir.path().join("wake");
+        let emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
+
+        let mailbox = Mailbox::new();
+        let writer = test_writer();
+        let channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+
+        emitter.emit_rich(1_000, &mailbox, &writer, &channels, "seat_pk");
+
+        let raw = std::fs::read_to_string(&wake_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("must be valid JSON even with no badges");
+
+        assert_eq!(parsed["v"].as_u64(), Some(1));
+        let chans = parsed["channels"]
+            .as_object()
+            .expect("channels must be a JSON object");
+        assert!(
+            chans.is_empty(),
+            "no unread messages means empty channels object"
         );
     }
 
