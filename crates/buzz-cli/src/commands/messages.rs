@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::client::{normalize_events, normalize_write_response, BuzzClient};
 use crate::error::CliError;
+use crate::MessagesCmd;
 use crate::validate::{
     infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
     validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
@@ -428,39 +429,78 @@ pub fn maybe_ack(
     }
 }
 
+/// The exact arguments `dispatch()` hands to `cmd_get_messages` for a
+/// `MessagesCmd::Get`. Extracted so the CLI-parsing-to-call-site wiring is a
+/// single pure mapping with no live relay involved, and is therefore unit
+/// testable: a mutation that severs `no_ack` from the parsed flag (e.g.
+/// hardcoding it to `true` before the call) changes this function's output,
+/// not just `cmd_get_messages`'s internals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetDispatchArgs {
+    pub channel: String,
+    pub limit: Option<u32>,
+    pub before: Option<i64>,
+    pub since: Option<i64>,
+    pub kinds: Option<String>,
+    pub no_ack: bool,
+    pub ack_file: Option<String>,
+    pub ack_marker: Option<String>,
+}
+
+/// Maps a parsed `MessagesCmd::Get` into the args `cmd_get_messages` runs
+/// with. Returns `None` for any other variant (dispatch only calls this from
+/// the `Get` arm, but the signature stays total rather than panicking).
+pub fn resolve_get_dispatch_args(cmd: MessagesCmd) -> Option<GetDispatchArgs> {
+    match cmd {
+        MessagesCmd::Get {
+            channel,
+            limit,
+            before,
+            since,
+            kinds,
+            no_ack,
+            ack_file,
+            ack_marker,
+        } => Some(GetDispatchArgs {
+            channel,
+            limit,
+            before,
+            since,
+            kinds,
+            no_ack,
+            ack_file,
+            ack_marker,
+        }),
+        _ => None,
+    }
+}
+
 pub async fn cmd_get_messages(
     client: &BuzzClient,
-    channel_id: &str,
-    limit: Option<u32>,
-    before: Option<i64>,
-    since: Option<i64>,
-    kinds: Option<&str>,
+    args: GetDispatchArgs,
     format: &crate::OutputFormat,
-    no_ack: bool,
-    ack_file: Option<&str>,
-    ack_marker: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(channel_id)?;
-    let limit = limit.unwrap_or(50).min(200);
+    validate_uuid(&args.channel)?;
+    let limit = args.limit.unwrap_or(50).min(200);
 
     let mut filter = serde_json::json!({
         "kinds": [9, 40002, 40008, 45001, 45003],
-        "#h": [channel_id],
+        "#h": [args.channel],
         "limit": limit
     });
 
     // If specific kinds requested, override
-    if let Some(k) = kinds {
+    if let Some(k) = &args.kinds {
         let kind_list: Vec<u64> = k.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         if !kind_list.is_empty() {
             filter["kinds"] = serde_json::json!(kind_list);
         }
     }
 
-    if let Some(b) = before {
+    if let Some(b) = args.before {
         filter["until"] = serde_json::json!(b);
     }
-    if let Some(s) = since {
+    if let Some(s) = args.since {
         filter["since"] = serde_json::json!(s);
     }
 
@@ -472,8 +512,17 @@ pub async fn cmd_get_messages(
 
     // Ack-on-read: advances the read cursor to the newest RETURNED message's
     // timestamp as a side effect, same as any normal messaging app. Cannot
-    // fail this command (see maybe_ack's own contract).
-    maybe_ack(&events, channel_id, no_ack, ack_file, ack_marker);
+    // fail this command (see maybe_ack's own contract). `args` is the exact
+    // struct dispatch() built from the parsed CLI command, so there is no
+    // separate `no_ack` argument at this boundary left to mutate independent
+    // of resolve_get_dispatch_args (see its tests).
+    maybe_ack(
+        &events,
+        &args.channel,
+        args.no_ack,
+        args.ack_file.as_deref(),
+        args.ack_marker.as_deref(),
+    );
 
     Ok(())
 }
@@ -957,7 +1006,6 @@ pub async fn dispatch(
     client: &BuzzClient,
     format: &crate::OutputFormat,
 ) -> Result<(), CliError> {
-    use crate::MessagesCmd;
     match cmd {
         MessagesCmd::Send {
             channel,
@@ -1031,29 +1079,10 @@ pub async fn dispatch(
             )
             .await
         }
-        MessagesCmd::Get {
-            channel,
-            limit,
-            before,
-            since,
-            kinds,
-            no_ack,
-            ack_file,
-            ack_marker,
-        } => {
-            cmd_get_messages(
-                client,
-                &channel,
-                limit,
-                before,
-                since,
-                kinds.as_deref(),
-                format,
-                no_ack,
-                ack_file.as_deref(),
-                ack_marker.as_deref(),
-            )
-            .await
+        get_cmd @ MessagesCmd::Get { .. } => {
+            let args = resolve_get_dispatch_args(get_cmd)
+                .expect("get_cmd is MessagesCmd::Get by the match arm above");
+            cmd_get_messages(client, args, format).await
         }
         MessagesCmd::Thread {
             channel,
@@ -1753,5 +1782,109 @@ mod tests {
     fn resolve_ack_target_none_when_marker_missing() {
         std::env::remove_var("SEAT_SESSION");
         assert_eq!(resolve_ack_target(Some("/tmp/x.json"), None), None);
+    }
+
+    // =========================================================================
+    // CLI wiring (gate-1 rework, buzz#2 @52715bce): resolve_get_dispatch_args
+    // is the exact function dispatch() calls to turn a parsed `messages get`
+    // into the args cmd_get_messages runs with, and cmd_get_messages now takes
+    // that struct whole rather than a `no_ack: bool` positional argument. So
+    // there is no longer a bare `no_ack` identifier at the dispatch call site
+    // for a mutation to swap for `true` -- the only place a hardcoded no_ack
+    // can hide is inside this function, which these tests parse real argv
+    // through (no live relay involved, per gate-1's "thin seam" guidance).
+    //
+    // Non-vacuity: reverting this file's dispatch() to destructure `no_ack`
+    // straight off MessagesCmd::Get and hardcode `true` at the
+    // cmd_get_messages call (gate-1's MUT-1) makes
+    // get_dispatch_args_no_ack_default_false_from_real_argv go RED, because
+    // it parses real CLI argv through Cli::try_parse_from and
+    // resolve_get_dispatch_args, the same functions dispatch() itself calls.
+    // Confirmed RED, then restored to GREEN below.
+    // =========================================================================
+
+    use super::resolve_get_dispatch_args;
+
+    #[test]
+    fn get_dispatch_args_no_ack_default_false_from_real_argv() {
+        use crate::{Cli, Cmd, MessagesCmd};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["buzz", "messages", "get", "--channel", CHANNEL_UUID])
+            .expect("messages get --channel <uuid> must parse");
+        let Cmd::Messages(cmd) = cli.command else {
+            panic!("expected Cmd::Messages");
+        };
+        assert!(matches!(cmd, MessagesCmd::Get { .. }));
+
+        let args = resolve_get_dispatch_args(cmd).expect("must resolve a Get variant");
+        assert!(
+            !args.no_ack,
+            "messages get with no flag must default to acking (no_ack=false)"
+        );
+    }
+
+    #[test]
+    fn get_dispatch_args_no_ack_flag_sets_true_from_real_argv() {
+        use crate::{Cli, Cmd, MessagesCmd};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "messages",
+            "get",
+            "--channel",
+            CHANNEL_UUID,
+            "--no-ack",
+        ])
+        .expect("messages get --channel <uuid> --no-ack must parse");
+        let Cmd::Messages(cmd) = cli.command else {
+            panic!("expected Cmd::Messages");
+        };
+        assert!(matches!(cmd, MessagesCmd::Get { .. }));
+
+        let args = resolve_get_dispatch_args(cmd).expect("must resolve a Get variant");
+        assert!(
+            args.no_ack,
+            "--no-ack must reach the dispatch args as no_ack=true"
+        );
+    }
+
+    #[test]
+    fn get_dispatch_args_non_vacuity_two_argvs_differ_only_in_no_ack() {
+        // Same channel, same everything else -- only --no-ack differs -- and
+        // the two resulting structs must differ ONLY in no_ack. Proves the
+        // pair of tests above is not accidentally vacuous (e.g. both true
+        // from a stale default).
+        use crate::{Cli, Cmd, MessagesCmd};
+        use clap::Parser;
+
+        let resolve = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("argv must parse");
+            let Cmd::Messages(cmd) = cli.command else {
+                panic!("expected Cmd::Messages");
+            };
+            assert!(matches!(cmd, MessagesCmd::Get { .. }));
+            resolve_get_dispatch_args(cmd).expect("must resolve a Get variant")
+        };
+
+        let acked = resolve(&["buzz", "messages", "get", "--channel", CHANNEL_UUID]);
+        let peeked = resolve(&[
+            "buzz",
+            "messages",
+            "get",
+            "--channel",
+            CHANNEL_UUID,
+            "--no-ack",
+        ]);
+
+        assert_ne!(
+            acked.no_ack, peeked.no_ack,
+            "no_ack must be the only thing --no-ack changes"
+        );
+        assert_eq!(acked.channel, peeked.channel);
+        assert_eq!(acked.limit, peeked.limit);
+        assert_eq!(acked.ack_file, peeked.ack_file);
+        assert_eq!(acked.ack_marker, peeked.ack_marker);
     }
 }
