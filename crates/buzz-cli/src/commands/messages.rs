@@ -376,6 +376,58 @@ pub fn apply_autofold(
     crate::commands::read_ack::merge_and_write(ack_file, &channels, marker)
 }
 
+/// Resolve the ack file + marker for the auto-ack side effect.
+///
+/// Returns `None` (not an error) when the target cannot be resolved: no
+/// `--ack-file`/`READACK_FILE`, or no non-empty `--ack-marker`/`SEAT_SESSION`.
+/// Missing ack configuration is the normal, expected case for any caller
+/// that has no seat identity (a human at a terminal, an ad hoc script), and
+/// per design constraint 4 it must never turn into a read failure.
+pub fn resolve_ack_target(
+    ack_file: Option<&str>,
+    ack_marker: Option<&str>,
+) -> Option<(String, String)> {
+    let file = match ack_file {
+        Some(f) => f.to_string(),
+        None => std::env::var("READACK_FILE").ok()?,
+    };
+    let marker = match ack_marker {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => {
+            let from_env = std::env::var("SEAT_SESSION").unwrap_or_default();
+            if from_env.is_empty() {
+                return None;
+            }
+            from_env
+        }
+    };
+    Some((file, marker))
+}
+
+/// Ack-on-read side effect for `messages get`. Deliberately returns `()`,
+/// not `Result`: by TYPE, nothing this function does can fail the read that
+/// already happened above it (design constraint 4). `--no-ack` short-circuits
+/// before any I/O (design constraint 1: a peek must be a genuine read-only
+/// path). A write failure is reported on stderr as a warning, never on the
+/// exit code.
+pub fn maybe_ack(
+    events: &[serde_json::Value],
+    channel_id: &str,
+    no_ack: bool,
+    ack_file: Option<&str>,
+    ack_marker: Option<&str>,
+) {
+    if no_ack {
+        return;
+    }
+    let Some((resolved_file, resolved_marker)) = resolve_ack_target(ack_file, ack_marker) else {
+        return; // no ack config: quietly skip, this is not an error
+    };
+    if let Err(e) = apply_autofold(events, channel_id, &resolved_file, &resolved_marker) {
+        eprintln!("{{\"warning\":\"read-ack failed: {e}\"}}");
+    }
+}
+
 pub async fn cmd_get_messages(
     client: &BuzzClient,
     channel_id: &str,
@@ -384,7 +436,7 @@ pub async fn cmd_get_messages(
     since: Option<i64>,
     kinds: Option<&str>,
     format: &crate::OutputFormat,
-    ack: bool,
+    no_ack: bool,
     ack_file: Option<&str>,
     ack_marker: Option<&str>,
 ) -> Result<(), CliError> {
@@ -418,38 +470,10 @@ pub async fn cmd_get_messages(
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
 
-    // Autofold: write the readack marker if --ack is set.
-    if ack {
-        // Resolve ack file: flag first, then env var READACK_FILE. Hard-error
-        // when neither is present.
-        let resolved_file = match ack_file {
-            Some(f) => f.to_string(),
-            None => std::env::var("READACK_FILE").map_err(|_| {
-                CliError::Usage(
-                    "--ack requires --ack-file <PATH> or READACK_FILE env var".to_string(),
-                )
-            })?,
-        };
-
-        // Resolve marker: flag first, then SEAT_SESSION env var. Hard-error when
-        // neither resolves to a non-empty value. A silently-defaulted marker
-        // breaks the clerk honest-seen gate (the guard compares against the live
-        // claim file and a stale or default marker never matches).
-        let resolved_marker = match ack_marker {
-            Some(m) if !m.is_empty() => m.to_string(),
-            _ => {
-                let from_env = std::env::var("SEAT_SESSION").unwrap_or_default();
-                if from_env.is_empty() {
-                    return Err(CliError::Usage(
-                        "--ack requires --ack-marker <MARKER> or SEAT_SESSION env var".to_string(),
-                    ));
-                }
-                from_env
-            }
-        };
-
-        apply_autofold(&events, channel_id, &resolved_file, &resolved_marker)?;
-    }
+    // Ack-on-read: advances the read cursor to the newest RETURNED message's
+    // timestamp as a side effect, same as any normal messaging app. Cannot
+    // fail this command (see maybe_ack's own contract).
+    maybe_ack(&events, channel_id, no_ack, ack_file, ack_marker);
 
     Ok(())
 }
@@ -1013,7 +1037,7 @@ pub async fn dispatch(
             before,
             since,
             kinds,
-            ack,
+            no_ack,
             ack_file,
             ack_marker,
         } => {
@@ -1025,7 +1049,7 @@ pub async fn dispatch(
                 since,
                 kinds.as_deref(),
                 format,
-                ack,
+                no_ack,
                 ack_file.as_deref(),
                 ack_marker.as_deref(),
             )
@@ -1486,11 +1510,10 @@ mod tests {
         assert!(result.is_err(), "must error on unwritable path");
     }
 
-    // (c) messages get WITHOUT --ack writes no marker: the no-ack gate is
-    // structural (`if ack { apply_autofold(...) }` in cmd_get_messages) and
-    // cannot be exercised without a live relay. The empty/no-op write path
-    // (apply_autofold called with zero events) is covered by
-    // autofold_empty_events_writes_nothing below.
+    // (c) `--no-ack` writes no marker: covered directly below via maybe_ack,
+    // which is a pure, relay-free function extracted from cmd_get_messages
+    // specifically so this design constraint is testable without a live
+    // relay (see "ack-on-read" tests below).
 
     // (d) merge max-wins: a lower incoming ts does not regress a higher stored ts.
     #[test]
@@ -1528,5 +1551,207 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "no file should be written for empty event list"
         );
+    }
+
+    // =========================================================================
+    // ack-on-read (buzz#2): default-on ack via maybe_ack, and the four
+    // non-negotiable design constraints from the dispatch.
+    // =========================================================================
+
+    use super::{maybe_ack, resolve_ack_target};
+    // ---- Constraint 1: --no-ack is a genuine read-only path ----
+
+    #[test]
+    fn maybe_ack_with_no_ack_true_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[100, 200]);
+
+        maybe_ack(&events, CHANNEL_UUID, true, Some(&path), Some("sess-peek"));
+
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "--no-ack must never write the ack file, even with valid file/marker supplied"
+        );
+    }
+
+    #[test]
+    fn maybe_ack_non_vacuity_no_ack_false_with_same_inputs_does_write() {
+        // Same inputs as the test above except no_ack=false, to prove the
+        // no-ack test above is not vacuously passing (e.g. from a typo in
+        // the file path or a broken make_events helper).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[100, 200]);
+
+        maybe_ack(&events, CHANNEL_UUID, false, Some(&path), Some("sess-read"));
+
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "sanity: with no_ack=false the same call DOES write, proving the true case is meaningful"
+        );
+    }
+
+    // ---- Default-on behavior: reading acks without any explicit flag ----
+
+    #[test]
+    fn maybe_ack_default_on_advances_to_newest_returned_message() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+        let events = make_events(&[10, 30, 20]);
+
+        // no_ack=false is the DEFAULT now (clap default_value_t = false on
+        // the --no-ack flag), exercised directly here without any flag.
+        maybe_ack(
+            &events,
+            CHANNEL_UUID,
+            false,
+            Some(&path),
+            Some("sess-default"),
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(parsed.channels[CHANNEL_UUID], 30);
+    }
+
+    // ---- Constraint 2: advance to newest RETURNED message, never to "now" ----
+
+    #[test]
+    fn constraint2_limit_truncation_acks_only_to_newest_returned_not_beyond() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+
+        // Simulates: 10 messages exist in the channel (ts 100..1000), but
+        // --limit truncated the relay response down to only the oldest 3
+        // (100, 200, 300). Messages at 400..1000 exist but were NOT
+        // returned to this caller.
+        let truncated_events = make_events(&[100, 200, 300]);
+
+        maybe_ack(
+            &truncated_events,
+            CHANNEL_UUID,
+            false,
+            Some(&path),
+            Some("sess-trunc"),
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(
+            parsed.channels[CHANNEL_UUID], 300,
+            "must ack only to the newest RETURNED message (300), never past it: \
+             acking to 1000 or to \"now\" would mark the unreturned 400..1000 mail as read \
+             and silently lose it"
+        );
+    }
+
+    // (Non-vacuity for constraint 2 lives in the mutation record in the PR
+    // description: apply_autofold's `.max()` over `events` was swapped for
+    // a wall-clock "now" value and this test went RED, confirming it is not
+    // watching a no-op. Restored to `.max()` afterward.)
+
+    // ---- Constraint 3: the read-ack cursor is monotonic, never moves backward ----
+
+    #[test]
+    fn constraint3_concurrent_readers_cannot_regress_each_others_cursor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readack.json").display().to_string();
+
+        // Reader A reads up through ts=900.
+        maybe_ack(
+            &make_events(&[500, 900]),
+            CHANNEL_UUID,
+            false,
+            Some(&path),
+            Some("reader-a"),
+        );
+        // Reader B, a concurrent/stale session, reads an older page (ts up
+        // to 300 only) and acks after A.
+        maybe_ack(
+            &make_events(&[100, 300]),
+            CHANNEL_UUID,
+            false,
+            Some(&path),
+            Some("reader-b"),
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_multi_channel_ack(&raw).expect("must parse");
+        assert_eq!(
+            parsed.channels[CHANNEL_UUID], 900,
+            "a concurrent reader with an older page must never regress the cursor backward"
+        );
+    }
+
+    // (Non-vacuity for constraint 3 lives in the mutation record in the PR
+    // description: read_ack.rs's `if ts > *entry` was flipped to
+    // `if ts < *entry` and both this test and the existing
+    // autofold_merge_max_wins_no_regression / merge_second_call_adds_channel_and_bumps_ts_via_max
+    // tests in read_ack.rs went RED. Restored afterward.)
+
+    // ---- Constraint 4: an ack failure must never fail the read ----
+
+    #[test]
+    fn constraint4_missing_ack_config_does_not_panic_or_error_the_read() {
+        // No --ack-file/--ack-marker flags, and no READACK_FILE/SEAT_SESSION
+        // env vars: the common case for any caller with no seat identity.
+        std::env::remove_var("READACK_FILE");
+        std::env::remove_var("SEAT_SESSION");
+
+        let events = make_events(&[100]);
+        // maybe_ack returns () -- by TYPE this cannot propagate a failure to
+        // the caller. Reaching this line without panicking IS the proof.
+        maybe_ack(&events, CHANNEL_UUID, false, None, None);
+    }
+
+    #[test]
+    fn constraint4_ack_write_failure_does_not_panic_or_error_the_read() {
+        // A resolvable but unwritable target (parent directory does not
+        // exist): apply_autofold will return Err internally, and maybe_ack
+        // must swallow it (as a stderr warning) rather than propagate it.
+        let bad_path = "/tmp/nonexistent-dir-buzz2-353/readack.json";
+        let events = make_events(&[100]);
+        maybe_ack(&events, CHANNEL_UUID, false, Some(bad_path), Some("sess-x"));
+        assert!(
+            !std::path::Path::new(bad_path).exists(),
+            "the write genuinely failed (as intended by the bad path), and still did not panic"
+        );
+    }
+
+    // ---- resolve_ack_target: None on missing config, not an Err ----
+
+    #[test]
+    fn resolve_ack_target_returns_none_when_unconfigured() {
+        std::env::remove_var("READACK_FILE");
+        std::env::remove_var("SEAT_SESSION");
+        assert_eq!(resolve_ack_target(None, None), None);
+    }
+
+    #[test]
+    fn resolve_ack_target_resolves_from_flags() {
+        assert_eq!(
+            resolve_ack_target(Some("/tmp/x.json"), Some("m1")),
+            Some(("/tmp/x.json".to_string(), "m1".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_ack_target_falls_back_to_env_vars() {
+        std::env::set_var("READACK_FILE", "/tmp/from-env.json");
+        std::env::set_var("SEAT_SESSION", "env-marker");
+        let result = resolve_ack_target(None, None);
+        std::env::remove_var("READACK_FILE");
+        std::env::remove_var("SEAT_SESSION");
+        assert_eq!(
+            result,
+            Some(("/tmp/from-env.json".to_string(), "env-marker".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_ack_target_none_when_marker_missing() {
+        std::env::remove_var("SEAT_SESSION");
+        assert_eq!(resolve_ack_target(Some("/tmp/x.json"), None), None);
     }
 }
