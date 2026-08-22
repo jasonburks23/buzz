@@ -20,6 +20,8 @@ pub struct Badge {
     pub total_unread: u64,
     /// Unread events that warrant a badge notification: DM room or @mention.
     pub badge_unread: u64,
+    /// Max `created_at` across unread entries; `None` when there are none.
+    pub latest_unread_at: Option<u64>,
 }
 
 /// Compute badge counts for a room's entries.
@@ -35,6 +37,7 @@ pub fn compute_badge(
 ) -> Badge {
     let mut total_unread = 0u64;
     let mut badge_unread = 0u64;
+    let mut latest_unread_at: Option<u64> = None;
 
     for entry in entries {
         if entry.author_pubkey == seat_pubkey_hex {
@@ -48,6 +51,10 @@ pub fn compute_badge(
             continue;
         }
         total_unread += 1;
+        latest_unread_at = Some(match latest_unread_at {
+            Some(max_ts) => max_ts.max(entry.created_at),
+            None => entry.created_at,
+        });
         let is_mention = entry.p_tags.iter().any(|p| p == seat_pubkey_hex);
         if is_dm || is_mention {
             badge_unread += 1;
@@ -57,6 +64,7 @@ pub fn compute_badge(
     Badge {
         total_unread,
         badge_unread,
+        latest_unread_at,
     }
 }
 
@@ -79,6 +87,7 @@ pub fn unread_badge(
 ) -> Badge {
     let mut total_unread = 0u64;
     let mut badge_unread = 0u64;
+    let mut latest_unread_at: Option<u64> = None;
 
     for channel_id in mailbox.channel_ids() {
         let entries = mailbox.channel_entries(channel_id).unwrap_or_default();
@@ -90,11 +99,15 @@ pub fn unread_badge(
         let b = compute_badge(entries, read_at, is_dm, seat_pubkey_hex);
         total_unread += b.total_unread;
         badge_unread += b.badge_unread;
+        if let Some(ts) = b.latest_unread_at {
+            latest_unread_at = Some(latest_unread_at.map_or(ts, |max_ts| max_ts.max(ts)));
+        }
     }
 
     Badge {
         total_unread,
         badge_unread,
+        latest_unread_at,
     }
 }
 
@@ -125,6 +138,9 @@ pub struct ChannelBadge {
     pub kind: ChannelKind,
     pub total_unread: u32,
     pub badge_unread: u32,
+    /// `created_at` of this channel's newest unread entry. Guaranteed `Some`
+    /// on the `compute_badge` result whenever `total_unread > 0`.
+    pub latest_unread_at: u64,
 }
 
 /// Compute per-channel unread summaries, returning one entry per channel that
@@ -168,6 +184,7 @@ pub fn per_channel_badges(
             kind,
             total_unread: b.total_unread.min(u32::MAX as u64) as u32,
             badge_unread: b.badge_unread.min(u32::MAX as u64) as u32,
+            latest_unread_at: b.latest_unread_at.unwrap_or(0),
         });
     }
 
