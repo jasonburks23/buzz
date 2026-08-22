@@ -2205,18 +2205,40 @@ channels = "ALL"
         assert_eq!(configured.exit_after_inactivity, 120);
     }
 
+    /// Asserts against clap's *declared* default for an arg, not a parsed
+    /// instance — `CliArgs::parse_from` consults `env = "..."` fallbacks,
+    /// so a parsed default is only accurate when the invoking process has
+    /// the matching env var unset. This reads the declaration itself, so
+    /// it is correct regardless of the calling process's environment.
+    fn declared_default(id: &str) -> String {
+        use clap::CommandFactory;
+
+        let cmd = CliArgs::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == id)
+            .unwrap_or_else(|| panic!("no such arg: {id}"));
+        let defaults = arg.get_default_values();
+        assert_eq!(
+            defaults.len(),
+            1,
+            "expected exactly one default value for {id}, got {defaults:?}"
+        );
+        defaults[0].to_string_lossy().into_owned()
+    }
+
     #[test]
     fn lazy_pool_defaults_off() {
-        let key = "0".repeat(64);
-        assert!(!CliArgs::parse_from(["buzz-acp", "--private-key", &key]).lazy_pool);
+        assert_eq!(declared_default("lazy_pool"), "false");
     }
 
     #[test]
     fn idle_pool_sleep_defaults_disabled_and_accepts_cli_value() {
-        let key = "0".repeat(64);
-        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
-        assert_eq!(default.idle_pool_sleep, 0);
+        assert_eq!(declared_default("idle_pool_sleep"), "0");
 
+        // CLI flag always wins over env, so parsing an explicit value is
+        // not env-sensitive and stays a parsed-instance assertion.
+        let key = "0".repeat(64);
         let configured = CliArgs::parse_from([
             "buzz-acp",
             "--private-key",
