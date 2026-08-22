@@ -487,6 +487,71 @@ mod tests {
         );
     }
 
+    // emit_rich must stamp a channel with the NEWEST of its unread entries, not
+    // merely "a" per-channel value. A single-unread-message fixture cannot
+    // distinguish newest from oldest from first-inserted, so this seeds THREE
+    // unread entries in a deliberately out-of-order insertion sequence and
+    // requires the max. Also asserts a self-authored entry (which compute_badge
+    // already excludes from unread) cannot move the stamp, since that skip is
+    // otherwise unguarded by any timestamp-focused test.
+    #[test]
+    fn emit_rich_stamps_newest_of_several_unread_not_oldest_or_first_inserted() {
+        use crate::discovery::ChannelType;
+
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+        const AS_OF: u64 = 1_700_000_000;
+        const OLDEST: u64 = 1_650_000_000;
+        const NEWEST: u64 = 1_670_000_000;
+        const MIDDLE: u64 = 1_660_000_000;
+        const SELF_AUTHORED_NEWER_THAN_NEWEST: u64 = 1_680_000_000;
+
+        let dir = tempdir().unwrap();
+        let wake_path = dir.path().join("wake");
+        let emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
+
+        let ch = Uuid::new_v4();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(
+            ch,
+            ChannelInfo {
+                uuid: ch,
+                name: "team-chat".to_string(),
+                channel_type: ChannelType::Stream,
+            },
+        );
+
+        let mut mailbox = Mailbox::new();
+        // Deliberately out of order: neither first-inserted (OLDEST) nor
+        // last-inserted (MIDDLE) is the newest -- only NEWEST is.
+        mailbox.insert(ch, dm_entry("e1", OLDEST, ch, OTHER_PK));
+        mailbox.insert(ch, dm_entry("e2", NEWEST, ch, OTHER_PK));
+        mailbox.insert(ch, dm_entry("e3", MIDDLE, ch, OTHER_PK));
+        // Self-authored entry, newer than everything above. compute_badge skips
+        // own-authored entries entirely, so this must NOT become the stamp.
+        mailbox.insert(
+            ch,
+            dm_entry("e4-self", SELF_AUTHORED_NEWER_THAN_NEWEST, ch, SEAT_PK),
+        );
+
+        let writer = test_writer();
+        emitter.emit_rich(AS_OF, &mailbox, &writer, &channels, SEAT_PK);
+
+        let raw = std::fs::read_to_string(&wake_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("emit_rich must produce valid JSON");
+        let chans = parsed["channels"]
+            .as_object()
+            .expect("channels must be a JSON object");
+
+        assert_eq!(
+            chans[&ch.to_string()].as_u64(),
+            Some(NEWEST),
+            "stamp must be the NEWEST unread entry, not the oldest, the middle, \
+             the first-inserted, or a self-authored entry that is newer still"
+        );
+    }
+
     // emit_rich with no unread messages writes {"v":1,"channels":{}} (no pending wakes).
     #[test]
     fn emit_rich_empty_mailbox_writes_empty_channels() {
