@@ -404,4 +404,135 @@ mod tests {
             "second entry must have badge_unread == 0 (plain stream)"
         );
     }
+
+    // ── US-04 acceptance scenarios, re-homed onto per_channel_badges (buzz#13) ─
+    //
+    // US-04 (mailbox-wide unread badge) was originally proven against a
+    // standalone aggregate that buzz#5 deleted as dead (no consumer outside
+    // badge.rs). The behaviour US-04 describes did not go away: it is proven
+    // here against per_channel_badges, the function wake.rs actually calls in
+    // production. See buzz#13 for the name-traceability rationale.
+
+    // us04_s1: arrival of a new for-me message increments total_unread and
+    // badge_unread.
+    //
+    // Non-vacuity: mutating `total_unread += 1;` to `total_unread += 0;` in
+    // compute_badge makes this go RED (total_unread stays 0 after arrival).
+    // Confirmed RED, then restored GREEN.
+    #[test]
+    fn us04_s1_arrival_increments_total_and_badge_unread() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, dm_channel(ch));
+
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+
+        let writer = test_writer();
+        let badges = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(
+            badges.len(),
+            1,
+            "the new-for-me message must produce a badge entry"
+        );
+        assert_eq!(
+            badges[0].total_unread, 1,
+            "arrival of one for-me message must increment total_unread to 1"
+        );
+        assert_eq!(
+            badges[0].badge_unread, 1,
+            "arrival of one for-me message must increment badge_unread to 1"
+        );
+    }
+
+    // us04_s2: a live read advances the bookmark and decrements the badge; a
+    // fake actor cannot, and the badge is unchanged after the rejection.
+    //
+    // Non-vacuity: disarming the fake-actor guard in record_youyou_read
+    // (`if actor != live` -> `if false`) makes this go RED, because the fake
+    // actor's read then succeeds and the channel drops out of
+    // per_channel_badges instead of staying present. Confirmed RED, then
+    // restored GREEN.
+    #[test]
+    fn us04_s2_live_read_decrements_fake_actor_cannot() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, dm_channel(ch));
+
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+
+        let mut writer = test_writer();
+        let live = SessionMarker::new("live-session-001".to_string());
+        let fake = SessionMarker::new("fake-actor-999".to_string());
+
+        // A fake actor (marker != live) attempts the read. Must be refused,
+        // and the badge must be unchanged.
+        let fake_result = record_youyou_read(&mut writer, ch.to_string(), 100, &fake, &live);
+        assert!(
+            fake_result.is_err(),
+            "a fake actor's read attempt must be refused"
+        );
+        let badges_after_fake = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(
+            badges_after_fake.len(),
+            1,
+            "badge must be unchanged after a rejected fake-actor read"
+        );
+        assert_eq!(
+            badges_after_fake[0].total_unread, 1,
+            "total_unread must be unchanged after a rejected fake-actor read"
+        );
+
+        // The live session performs the same read. Must succeed, and the
+        // channel must now decrement out of per_channel_badges.
+        let live_result = record_youyou_read(&mut writer, ch.to_string(), 100, &live, &live);
+        assert!(live_result.is_ok(), "the live session's read must succeed");
+        let badges_after_live = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert!(
+            badges_after_live.is_empty(),
+            "badge must decrement (channel omitted) after the live session's read"
+        );
+    }
+
+    // us04_s3: client-side filing (mailbox insert with no record_youyou_read)
+    // increments and never decrements.
+    //
+    // Non-vacuity: mutating `total_unread += 1;` to `total_unread = 1;` in
+    // compute_badge makes this go RED (the second arrival resets the count
+    // to 1 instead of accumulating to 2). Confirmed RED, then restored GREEN.
+    #[test]
+    fn us04_s3_client_side_filing_only_increments_never_decrements() {
+        const SEAT_PK: &str = "seat_pk_aabb";
+        const OTHER_PK: &str = "other_pk_ccdd";
+
+        let ch = Uuid::new_v4();
+        let mut mailbox = Mailbox::new();
+        let mut channels: HashMap<Uuid, ChannelInfo> = HashMap::new();
+        channels.insert(ch, dm_channel(ch));
+
+        // First client-side filing: no record_youyou_read call anywhere.
+        mailbox.insert(ch, mailbox_entry_for("e1", 100, ch, OTHER_PK, vec![]));
+        let writer = test_writer();
+        let badges_after_first = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(
+            badges_after_first[0].total_unread, 1,
+            "first client-side filing must increment total_unread to 1"
+        );
+
+        // Second client-side filing: still no read receipt of any kind.
+        mailbox.insert(ch, mailbox_entry_for("e2", 200, ch, OTHER_PK, vec![]));
+        let badges_after_second = super::per_channel_badges(&mailbox, &writer, &channels, SEAT_PK);
+        assert_eq!(
+            badges_after_second[0].total_unread, 2,
+            "a second client-side filing must accumulate to 2, never decrement, \
+             absent any live read"
+        );
+    }
 }
