@@ -1016,8 +1016,12 @@ fn do_sign(key_id: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // reject self-attestation, and verify the owner's signature.
     let oa = load_auth_tag()?;
     if let Some(ref oa_val) = oa {
-        // Owner pubkey must be a valid BIP-340 key
-        if PublicKey::from_hex(&oa_val.0).is_err() {
+        // Owner pubkey must be a valid BIP-340 key — from_hex only checks hex
+        // shape, so also convert to x-only to reject non-curve-points.
+        if PublicKey::from_hex(&oa_val.0)
+            .and_then(|pk| pk.xonly())
+            .is_err()
+        {
             return Err(Error::Fatal(
                 "auth tag owner (oa[0]) is not a valid BIP-340 public key".to_string(),
             ));
@@ -1187,7 +1191,8 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
         });
     }
 
-    // Validate pk is a valid BIP-340 x-only public key
+    // Decode pk as hex; the curve check that makes this a real BIP-340
+    // x-only public key happens below via .xonly() before signature verify.
     let pk = PublicKey::from_hex(&envelope.pk).map_err(|e| {
         write_errsig(status, Some(&envelope.pk));
         Error::VerifyFailed {
@@ -1242,8 +1247,12 @@ fn do_verify(sig_file: &str, status: &mut StatusWriter) -> Result<(), Error> {
     // Signature is valid — check NIP-OA if present and track result.
     let oa_result = if let Some(ref oa) = envelope.oa {
         // Validate oa[0] is a valid BIP-340 public key. Per NIP-GS spec,
-        // an invalid owner pubkey is a structural error → ERRSIG.
-        if PublicKey::from_hex(&oa.0).is_err() {
+        // an invalid owner pubkey is a structural error → ERRSIG. from_hex
+        // alone only checks hex shape, so also convert to x-only.
+        if PublicKey::from_hex(&oa.0)
+            .and_then(|pk| pk.xonly())
+            .is_err()
+        {
             write_errsig(status, Some(&envelope.pk));
             return Err(Error::VerifyFailed {
                 pk: Some(envelope.pk),
@@ -1421,6 +1430,7 @@ fn parse_envelope(json_str: &str) -> Result<Envelope, String> {
 
         // Validate oa[0] is a valid BIP-340 x-only public key (not just hex)
         PublicKey::from_hex(owner)
+            .and_then(|pk| pk.xonly())
             .map_err(|e| format!("oa[0] is not a valid BIP-340 public key: {e}"))?;
 
         // Self-attestation is meaningless — owner must differ from signer
@@ -2261,8 +2271,8 @@ Initial commit"
         if !is_lower_hex(&owner, 64) {
             return Err("auth tag owner must be 64 lowercase hex chars".to_string());
         }
-        PublicKey::from_hex(&owner)
-            .map_err(|e| format!("auth tag owner is not a valid BIP-340 key: {e}"))?;
+        // Test-only helper: this checks hex shape only, not curve validity.
+        PublicKey::from_hex(&owner).map_err(|e| format!("auth tag owner is not valid hex: {e}"))?;
         if !is_lower_hex(&sig, 128) {
             return Err("auth tag sig must be 128 lowercase hex chars".to_string());
         }
