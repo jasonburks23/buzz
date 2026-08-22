@@ -323,6 +323,10 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Seat clerk read-bookmark gate: pure in-process session-marker
+        # decision logic (no infra). Guards the live-actor check that read
+        # bookmarks only advance for the live session.
+        cargo nextest run -p buzz-seat-clerk --lib
     else
         ./scripts/run-tests.sh unit
     fi
