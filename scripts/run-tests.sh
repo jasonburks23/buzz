@@ -112,6 +112,12 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Seat clerk read-bookmark gate: pure in-process session-marker decision
+  # logic (no infra). Mirrors the nextest path in `just test-unit` — the
+  # two lists must stay in step or the fallback silently covers less.
+  run_test_step "buzz-seat-clerk tests" \
+    cargo test -p buzz-seat-clerk --lib -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
