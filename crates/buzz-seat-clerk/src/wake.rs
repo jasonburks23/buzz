@@ -2,7 +2,10 @@
 //!
 //! On Lane-1 (ForMe) events, writes a rich JSON wake object to a configured file.
 //! The MCP bridge (buzz-bridge.ts) watches this file and expects the shape:
-//!   `{"v":1,"channels":{"<uuid>":<unix_secs>,...}}`
+//!   `{"v":1,"channels":{"<uuid>":<latest_unread_at>,...}}`
+//! Each channel's timestamp is that channel's own newest-unread `created_at`,
+//! not the wall-clock time of the wake that triggered the write -- an untouched
+//! room must never get a fresh "now" stamp just because some other room woke.
 //!
 //! Also writes a `<wake_file>.rooms` sidecar JSON (per-channel unread summary)
 //! immediately after each Lane-1 wake so the woken session can open the right
@@ -48,7 +51,9 @@ impl WakeEmitter {
 
     /// Write the rich v1 wake JSON that buzz-bridge.ts expects.
     ///
-    /// Shape: `{"v":1,"channels":{"<channel-uuid>":<unix_secs>,...}}`
+    /// Shape: `{"v":1,"channels":{"<channel-uuid>":<latest_unread_at>,...}}`.
+    /// Each channel's stamp is its own newest-unread `created_at`; `unix_secs`
+    /// (this wake's wall-clock time) is not used as a per-channel stamp.
     ///
     /// Only channels with `total_unread > 0` are included (they are the same
     /// channels that `emit_badge_sidecar` writes to the `.rooms` sidecar).
@@ -70,13 +75,22 @@ impl WakeEmitter {
     }
 
     /// Inner helper: build and write the v1 JSON from an already-computed badge slice.
-    fn emit_rich_from_badges(&self, unix_secs: u64, badges: &[ChannelBadge]) {
-        // Build the channels map: key = channel UUID string, value = wake timestamp.
-        // Include all channels present in the badges list (each has total_unread > 0
-        // by construction from per_channel_badges).
+    ///
+    /// `_unix_secs` (this wake's wall-clock time) is intentionally unused for the
+    /// per-channel stamps below -- each channel gets its own `latest_unread_at`
+    /// instead, so an untouched room is never stamped with a fresh "now".
+    fn emit_rich_from_badges(&self, _unix_secs: u64, badges: &[ChannelBadge]) {
+        // Build the channels map: key = channel UUID string, value = that channel's
+        // own newest-unread timestamp. Include all channels present in the badges
+        // list (each has total_unread > 0 by construction from per_channel_badges).
         let channels_map: serde_json::Map<String, serde_json::Value> = badges
             .iter()
-            .map(|b| (b.channel_id.to_string(), serde_json::Value::from(unix_secs)))
+            .map(|b| {
+                (
+                    b.channel_id.to_string(),
+                    serde_json::Value::from(b.latest_unread_at),
+                )
+            })
             .collect();
 
         let payload = serde_json::json!({
@@ -368,9 +382,12 @@ mod tests {
         );
     }
 
-    // emit_rich writes a v1 JSON object that buzz-bridge.ts can parse.
-    // Asserts: file contains valid JSON with v=1 and channels as an object,
-    // each key is a channel UUID string and each value is the unix timestamp.
+    // emit_rich writes a v1 JSON object that buzz-bridge.ts can parse, and
+    // stamps EACH channel with ITS OWN newest-unread time, not the shared
+    // wake-time AS_OF. This is the regression test for the phantom "1 new in
+    // every room" bug (buzz#4): the old code stamped every channel with the
+    // wall-clock time of whichever event triggered the wake, so a room
+    // untouched for days looked freshly active on every poke.
     #[test]
     fn emit_rich_writes_v1_wake_json() {
         use crate::discovery::ChannelType;
@@ -378,6 +395,8 @@ mod tests {
         const SEAT_PK: &str = "seat_pk_aabb";
         const OTHER_PK: &str = "other_pk_ccdd";
         const AS_OF: u64 = 1_700_000_000;
+        const CH1_LATEST: u64 = 1_650_000_000;
+        const CH2_LATEST: u64 = 1_660_000_000;
 
         let dir = tempdir().unwrap();
         let wake_path = dir.path().join("wake");
@@ -404,9 +423,11 @@ mod tests {
             },
         );
 
+        // Two channels, two DIFFERENT newest-unread times, both distinct from
+        // AS_OF (the wake trigger's wall-clock time).
         let mut mailbox = Mailbox::new();
-        mailbox.insert(ch1, dm_entry("e1", 100, ch1, OTHER_PK));
-        mailbox.insert(ch2, dm_entry("e2", 100, ch2, OTHER_PK));
+        mailbox.insert(ch1, dm_entry("e1", CH1_LATEST, ch1, OTHER_PK));
+        mailbox.insert(ch2, dm_entry("e2", CH2_LATEST, ch2, OTHER_PK));
 
         let writer = test_writer();
 
@@ -438,16 +459,24 @@ mod tests {
             "ch2 UUID must be a key in channels"
         );
 
-        // Each value must be the unix timestamp.
+        // Each channel's value must be ITS OWN newest-unread time, not AS_OF.
         assert_eq!(
             chans[&ch1_str].as_u64(),
-            Some(AS_OF),
-            "ch1 wake timestamp must equal AS_OF"
+            Some(CH1_LATEST),
+            "ch1 wake timestamp must equal ch1's newest unread message, not the shared AS_OF"
         );
         assert_eq!(
             chans[&ch2_str].as_u64(),
-            Some(AS_OF),
-            "ch2 wake timestamp must equal AS_OF"
+            Some(CH2_LATEST),
+            "ch2 wake timestamp must equal ch2's newest unread message, not the shared AS_OF"
+        );
+
+        // The two channels must diverge from each other -- this is the crux of
+        // the fix. Stamping both with a shared scalar (old behavior) collapses
+        // this assertion.
+        assert_ne!(
+            chans[&ch1_str], chans[&ch2_str],
+            "channels with different newest-unread times must get different stamps"
         );
 
         // No extra keys.
