@@ -2191,10 +2191,11 @@ channels = "ALL"
 
     #[test]
     fn inactivity_exit_defaults_disabled_and_accepts_cli_value() {
-        let key = "0".repeat(64);
-        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &key]);
-        assert_eq!(default.exit_after_inactivity, 0);
+        assert_eq!(declared_default("exit_after_inactivity"), "0");
 
+        // CLI flag always wins over env, so parsing an explicit value is
+        // not env-sensitive and stays a parsed-instance assertion.
+        let key = "0".repeat(64);
         let configured = CliArgs::parse_from([
             "buzz-acp",
             "--private-key",
@@ -2606,12 +2607,12 @@ channels = "ALL"
 
     #[test]
     fn test_multiple_event_handling_default_is_steer() {
-        // Parse a minimal arg set; the default for --multiple-event-handling
-        // must be `steer` (steering is the default mid-turn delivery path).
-        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
-        assert_eq!(args.multiple_event_handling, MultipleEventHandling::Steer);
-        // Dedup default must remain `queue` so steering's requirement is met.
-        assert!(matches!(args.dedup, DedupMode::Queue));
+        // The default for --multiple-event-handling must be `steer` (steering
+        // is the default mid-turn delivery path), and --dedup must default to
+        // `queue` so steering's requirement is met. Both read against clap's
+        // declared default, not a parsed instance — see `declared_default`.
+        assert_eq!(declared_default("multiple_event_handling"), "steer");
+        assert_eq!(declared_default("dedup"), "queue");
     }
 
     #[test]
@@ -2793,10 +2794,30 @@ channels = "ALL"
     const TEST_PRIVATE_KEY: &str =
         "0000000000000000000000000000000000000000000000000000000000000001";
 
+    /// Parses argv into `CliArgs` with every arg's env fallback stripped, so
+    /// `Config::from_args` integration tests build the exact config their
+    /// argv describes — no `BUZZ_ACP_*` var in the invoking process's
+    /// environment can populate a field the test didn't mention, whether
+    /// that field is the one under test or an incidental one that
+    /// `Config::from_args` cross-validates against it (e.g. `idle_timeout`
+    /// vs `max_turn_duration`, `dedup` vs `multiple_event_handling`).
+    ///
+    /// This only affects how test argv is parsed. The production path
+    /// (`Config::from_cli` → `CliArgs::parse()`) uses clap's standard
+    /// `Parser::parse()`, which still reads every `#[arg(env = "...")]`
+    /// normally — env-var configuration in the shipped binary is untouched.
+    fn parse_cli_args_env_isolated(argv: &[&str]) -> Result<CliArgs, clap::Error> {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let cmd = CliArgs::command().mut_args(|a| a.env(None::<&str>));
+        let matches = cmd.try_get_matches_from(argv)?;
+        CliArgs::from_arg_matches(&matches)
+    }
+
     #[test]
     fn allowed_respond_to_full_path_rejects_disallowed_mode() {
         // --allowed-respond-to=owner-only,allowlist + --respond-to=anyone → ConfigError
-        let args = CliArgs::try_parse_from([
+        let args = parse_cli_args_env_isolated(&[
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
@@ -2826,7 +2847,7 @@ channels = "ALL"
     #[test]
     fn allowed_respond_to_full_path_accepts_allowed_mode() {
         // --allowed-respond-to=owner-only,allowlist + --respond-to=owner-only → Ok
-        let args = CliArgs::try_parse_from([
+        let args = parse_cli_args_env_isolated(&[
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
@@ -2846,8 +2867,9 @@ channels = "ALL"
 
     #[test]
     fn allowed_respond_to_full_path_unset_allows_all() {
-        // No --allowed-respond-to flag → anyone is accepted.
-        let args = CliArgs::try_parse_from([
+        // No --allowed-respond-to flag, and env is stripped, so
+        // allowed_respond_to parses to a genuine None → anyone is accepted.
+        let args = parse_cli_args_env_isolated(&[
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
@@ -2867,12 +2889,17 @@ channels = "ALL"
 
     #[test]
     fn max_turn_duration_at_ceiling_is_accepted() {
-        let args = CliArgs::try_parse_from([
+        // Env is stripped, so idle_timeout and allowed_respond_to fall back
+        // to their compiled defaults (900s, unset) regardless of what the
+        // invoking process's BUZZ_ACP_IDLE_TIMEOUT / BUZZ_ACP_ALLOWED_RESPOND_TO
+        // hold — nothing but max_turn_duration can affect this test's outcome.
+        let ceiling = MAX_TURN_DURATION_CEILING_SECS.to_string();
+        let args = parse_cli_args_env_isolated(&[
             "buzz-acp",
             "--private-key",
             TEST_PRIVATE_KEY,
             "--max-turn-duration",
-            &MAX_TURN_DURATION_CEILING_SECS.to_string(),
+            &ceiling,
         ])
         .expect("clap should parse args");
         let result = Config::from_args(args);
