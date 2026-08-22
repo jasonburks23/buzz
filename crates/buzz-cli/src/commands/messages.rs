@@ -1887,4 +1887,81 @@ mod tests {
         assert_eq!(acked.ack_file, peeked.ack_file);
         assert_eq!(acked.ack_marker, peeked.ack_marker);
     }
+
+    // =========================================================================
+    // buzz#6: structural assertion that dispatch()'s Get arm forwards the
+    // resolved args verbatim. The tests above prove resolve_get_dispatch_args
+    // maps parsed argv to a GetDispatchArgs correctly; they cannot see whether
+    // dispatch() then hands that struct to cmd_get_messages unmodified, or
+    // quietly rewrites a field on the way past. buzz#2 gate-1 and gate-2 both
+    // reproduced and consciously passed exactly that gap:
+    //
+    //   let args = resolve_get_dispatch_args(get_cmd).expect(...);
+    //   let args = GetDispatchArgs { no_ack: true, ..args };   // survives all 371
+    //   cmd_get_messages(client, args, format).await
+    //
+    // This is a source-level check (the cd#126 NOA-guard body-slice
+    // technique): slice dispatch()'s own source text down to just the Get
+    // arm's body -- so a comment or unrelated code elsewhere in the file
+    // cannot satisfy it -- and assert on that slice alone.
+    //
+    // Non-vacuity: planting the exact mutation above at the call site (not
+    // inside resolve_get_dispatch_args) makes get_arm_forwards_args_verbatim
+    // go RED, because the slice picks up the intervening `let args =
+    // GetDispatchArgs { .. }` rebinding. Confirmed RED, then restored GREEN.
+    // =========================================================================
+
+    const DISPATCH_SOURCE: &str = include_str!("messages.rs");
+
+    /// Slices `dispatch()`'s source down to just the `MessagesCmd::Get` arm
+    /// body, from its opening brace to the next match arm (`Thread`).
+    fn get_arm_body(src: &str) -> &str {
+        let start_marker = "get_cmd @ MessagesCmd::Get { .. } => {";
+        let start = src.find(start_marker).expect(
+            "dispatch()'s MessagesCmd::Get arm must exist -- update this slice if it moves",
+        );
+        let end_marker = "MessagesCmd::Thread {";
+        let end = src[start..].find(end_marker).map(|offset| start + offset).expect(
+            "could not find the next match arm after Get -- update this slice if dispatch() is restructured",
+        );
+        &src[start..end]
+    }
+
+    #[test]
+    fn get_arm_forwards_args_verbatim() {
+        let body = get_arm_body(DISPATCH_SOURCE);
+
+        assert_eq!(
+            body.matches("let args").count(),
+            1,
+            "the Get arm must bind `args` exactly once (from resolve_get_dispatch_args) -- \
+             a second `let args = ...` rebinding between the resolve and the call is the exact \
+             wiring gap buzz#6 exists to close:\n{body}"
+        );
+
+        // The "let args" count alone cannot see a struct-update override folded into the
+        // SAME binding's initializer (`let args = GetDispatchArgs { no_ack: true,
+        // ..resolve_get_dispatch_args(get_cmd).expect(..) }`) -- the count stays 1 and the
+        // resolve/call substrings both still appear, just nested inside the override. Pin
+        // the binding's initializer to the bare resolve call so that shape is caught too.
+        assert!(
+            body.contains("let args = resolve_get_dispatch_args(get_cmd)"),
+            "the single `args` binding's initializer must be the bare resolve call, not a \
+             struct-update override:\n{body}"
+        );
+
+        let resolve_at = body
+            .find("resolve_get_dispatch_args(get_cmd)")
+            .expect("the arm must call resolve_get_dispatch_args(get_cmd)");
+        let call_at = body
+            .find("cmd_get_messages(client, args, format).await")
+            .expect(
+                "the arm must forward to cmd_get_messages(client, args, format).await verbatim",
+            );
+
+        assert!(
+            call_at > resolve_at,
+            "cmd_get_messages must be called after resolve_get_dispatch_args:\n{body}"
+        );
+    }
 }
