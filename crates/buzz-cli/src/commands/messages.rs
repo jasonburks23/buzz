@@ -1939,6 +1939,17 @@ mod tests {
              wiring gap buzz#6 exists to close:\n{body}"
         );
 
+        // The "let args" count alone cannot see a struct-update override folded into the
+        // SAME binding's initializer (`let args = GetDispatchArgs { no_ack: true,
+        // ..resolve_get_dispatch_args(get_cmd).expect(..) }`) -- the count stays 1 and the
+        // resolve/call substrings both still appear, just nested inside the override. Pin
+        // the binding's initializer to the bare resolve call so that shape is caught too.
+        assert!(
+            body.contains("let args = resolve_get_dispatch_args(get_cmd)"),
+            "the single `args` binding's initializer must be the bare resolve call, not a \
+             struct-update override:\n{body}"
+        );
+
         let resolve_at = body
             .find("resolve_get_dispatch_args(get_cmd)")
             .expect("the arm must call resolve_get_dispatch_args(get_cmd)");
