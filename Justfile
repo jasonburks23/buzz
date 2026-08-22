@@ -294,8 +294,16 @@ ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri
 test:
     ./scripts/run-tests.sh all
 
+# Coverage comparator (buzz#10): fails loudly, naming the crate, if a
+# workspace member is gated in neither hand-maintained crate list below nor
+# docs/test-unit-exclusions.md, or if the two lists gate different crate
+# sets. Run before the nextest branch so an unlisted crate blocks the gate
+# regardless of which branch runs.
+test-unit-coverage-check:
+    ./scripts/check-test-unit-coverage.sh
+
 # Run unit tests only (no infra needed)
-test-unit:
+test-unit: test-unit-coverage-check
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v cargo-nextest &>/dev/null; then
@@ -327,6 +335,18 @@ test-unit:
         # decision logic (no infra). Guards the live-actor check that read
         # bookmarks only advance for the live session.
         cargo nextest run -p buzz-seat-clerk --lib
+        # buzz#10 slice one: full invocation (not --lib-scoped — none of
+        # these need that scoping; confirmed by running each crate's
+        # complete suite with zero infra before wiring it here).
+        cargo nextest run -p buzz-acp
+        cargo nextest run -p git-sign-nostr
+        cargo nextest run -p buzz-agent
+        cargo nextest run -p buzz-sdk
+        cargo nextest run -p buzz-persona
+        # buzz-workflow: 155 real assertions, 2 legitimately ignored
+        # (Postgres-gated tests in the lib target). Gates 155 of 157, not
+        # silently claiming full coverage.
+        cargo nextest run -p buzz-workflow
     else
         ./scripts/run-tests.sh unit
     fi

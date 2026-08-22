@@ -78,6 +78,13 @@ ensure_infra() {
 run_unit_tests() {
   section "Unit Tests (no infra required)"
 
+  # Coverage comparator (buzz#10): fails loudly, naming the crate, if a
+  # workspace member is gated in neither hand-maintained crate list below
+  # nor docs/test-unit-exclusions.md, or if this list and the Justfile
+  # nextest branch gate different crate sets. Runs before every step below
+  # so an unlisted crate blocks this branch too, not just the nextest one.
+  "${REPO_ROOT}/scripts/check-test-unit-coverage.sh"
+
   run_test_step "buzz-core tests" \
     cargo test -p buzz-core --lib -- --nocapture
 
@@ -118,6 +125,30 @@ run_unit_tests() {
   # two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-seat-clerk tests" \
     cargo test -p buzz-seat-clerk --lib -- --nocapture
+
+  # buzz#10 slice one: full invocation (not --lib-scoped — none of these
+  # need that scoping). Mirrors the nextest path in `just test-unit` — the
+  # two lists must stay in step or the fallback silently covers less.
+  run_test_step "buzz-acp tests" \
+    cargo test -p buzz-acp -- --nocapture
+
+  run_test_step "git-sign-nostr tests" \
+    cargo test -p git-sign-nostr -- --nocapture
+
+  run_test_step "buzz-agent tests" \
+    cargo test -p buzz-agent -- --nocapture
+
+  run_test_step "buzz-sdk tests" \
+    cargo test -p buzz-sdk -- --nocapture
+
+  run_test_step "buzz-persona tests" \
+    cargo test -p buzz-persona -- --nocapture
+
+  # buzz-workflow: 155 real assertions, 2 legitimately ignored
+  # (Postgres-gated tests in the lib target). Gates 155 of 157, not
+  # silently claiming full coverage.
+  run_test_step "buzz-workflow tests" \
+    cargo test -p buzz-workflow -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
