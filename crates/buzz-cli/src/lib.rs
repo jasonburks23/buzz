@@ -480,7 +480,7 @@ pub enum MessagesCmd {
     },
     /// Retrieve messages from a channel
     #[command(
-        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984\n  buzz messages get --channel <UUID> --ack"
+        after_help = "Examples:\n  buzz messages get --channel <UUID>\n  buzz messages get --channel <UUID> --limit 50 --kinds 1,1984\n  buzz messages get --channel <UUID> --no-ack"
     )]
     Get {
         /// Channel UUID
@@ -498,10 +498,15 @@ pub enum MessagesCmd {
         /// Comma-separated event kinds to filter (e.g. 1,1984)
         #[arg(long)]
         kinds: Option<String>,
-        /// After fetching, write the read-ack marker for this channel.
-        /// Requires READACK_FILE and SEAT_SESSION env vars (or --ack-file and --ack-marker).
+        /// Peek without marking read: skip the read-ack side effect below.
+        /// By default, a successful read advances this channel's read-ack
+        /// marker to the newest RETURNED message's timestamp, same as any
+        /// normal messaging app. Requires READACK_FILE and SEAT_SESSION env
+        /// vars (or --ack-file and --ack-marker) to actually be configured;
+        /// if neither is set, the ack is silently skipped (the read never
+        /// fails because of it).
         #[arg(long, default_value_t = false)]
-        ack: bool,
+        no_ack: bool,
         /// Path to the readack file. Overrides READACK_FILE env var.
         #[arg(long)]
         ack_file: Option<String>,
