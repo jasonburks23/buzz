@@ -44,6 +44,7 @@ members=$(awk '/^members = \[/,/^\]/' "${CARGO_TOML}" \
 
 nextest_block=$(awk '/^test-unit:/,/^# Run integration tests only/' "${JUSTFILE}")
 nextest_crates=$(echo "${nextest_block}" \
+  | grep -vE '^\s*#' \
   | grep -oE '\-p [A-Za-z0-9_-]+' \
   | awk '{print $2}' \
   | sort -u)
@@ -52,6 +53,7 @@ nextest_crates=$(echo "${nextest_block}" \
 
 run_tests_block=$(awk '/^run_unit_tests\(\) \{/,/^\}/' "${RUN_TESTS_SH}")
 run_tests_crates=$(echo "${run_tests_block}" \
+  | grep -vE '^\s*#' \
   | grep -oE '\-p [A-Za-z0-9_-]+' \
   | awk '{print $2}' \
   | sort -u)
