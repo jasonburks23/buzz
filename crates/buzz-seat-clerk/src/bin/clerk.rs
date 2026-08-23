@@ -220,6 +220,32 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // comms-orch#24 item 3: the live session marker was resolved
+            // ONCE at boot; re-check it every tick so a seat restart or
+            // compact (which spawns a new Claude Code session) is noticed
+            // by a long-lived clerk instead of silently delivering to a
+            // session that no longer exists. Exit, never self-heal: launchd
+            // (KeepAlive) is the restarter, and the fresh launch resolves
+            // the new marker at step one. Nothing new and long-lived is
+            // added here, only a comparison on the tick that already runs.
+            if let Some(ref boot_marker) = live_marker {
+                if let Some(ref role) = cfg.seat_role {
+                    if let Some(new_marker) = recheck_live_session(
+                        Path::new(&cfg.claim_dir),
+                        role,
+                        cfg.seat_cwd.as_deref(),
+                        boot_marker,
+                    ) {
+                        error!(
+                            old = boot_marker.log_fingerprint(),
+                            new = new_marker.log_fingerprint(),
+                            "live session changed since boot; exiting so launchd restarts with the fresh marker"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             match conn.next_event(NEXT_EVENT_TIMEOUT).await {
                 Ok(RelayMessage::Event { event, .. }) => {
                     let event_id = event.id.to_hex();
@@ -320,6 +346,33 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// comms-orch#24 item 3: re-checks the live session marker against the one
+/// resolved at boot (clerk.rs main(), line ~53). `resolve_live_marker_from_claims`
+/// previously only ran ONCE at process start; a clerk that keeps running
+/// while its seat's Claude Code session restarts or compacts into a new
+/// session then holds a marker for a session that no longer exists, and
+/// nothing notices, because a re-launched clerk resolves correctly every
+/// time -- this bug is invisible on a fresh start and only bites a
+/// long-lived daemon.
+///
+/// Returns Some(new_marker) only when re-resolution SUCCEEDS and produces a
+/// GENUINELY DIFFERENT marker than boot_marker. A re-resolution ERROR
+/// (transient claim-dir read hiccup, directory momentarily missing, etc.)
+/// returns None deliberately: the daemon keeps running on its last-known
+/// marker rather than crash-looping on a blip. Only a confirmed, resolved
+/// divergence is worth restarting for.
+fn recheck_live_session(
+    claim_dir: &Path,
+    role: &str,
+    cwd: Option<&str>,
+    boot_marker: &SessionMarker,
+) -> Option<SessionMarker> {
+    match resolve_live_marker_from_claims(claim_dir, role, cwd) {
+        Ok(current) if current != *boot_marker => Some(current),
+        _ => None,
     }
 }
 
@@ -645,6 +698,95 @@ mod tests {
                 Some(1),
                 "non-live read must not drop the count"
             );
+        }
+    }
+
+    // ── comms-orch#24 item 3: session-marker re-check on the event loop tick ──
+    //
+    // resolve_live_marker_from_claims previously ran ONCE at boot; a clerk
+    // that keeps running while its seat's session restarts or compacts into
+    // a new one then holds a marker for a session that no longer exists,
+    // silently. recheck_live_session is the per-tick guard against that.
+    mod session_recheck {
+        use super::*;
+        use std::fs;
+
+        fn write_claim(dir: &std::path::Path, session_id: &str, role: &str, cwd: &str, ts: &str) {
+            let name = format!("claude-seat-claim-{session_id}.json");
+            let body = format!(
+                r#"{{"session_id":"{session_id}","role":"{role}","cwd":"{cwd}","ts":"{ts}"}}"#
+            );
+            fs::write(dir.join(name), body).unwrap();
+        }
+
+        #[test]
+        fn unchanged_marker_returns_none() {
+            let dir = tempdir().unwrap();
+            write_claim(
+                dir.path(),
+                "sess-a",
+                "Overwatch",
+                "/cwd",
+                "2026-08-23T21:00:00Z",
+            );
+            let boot = SessionMarker::new("sess-a".to_string());
+            let result = recheck_live_session(dir.path(), "Overwatch", Some("/cwd"), &boot);
+            assert!(
+                result.is_none(),
+                "the same live session must not trigger a divergence"
+            );
+        }
+
+        #[test]
+        fn changed_marker_returns_some_with_the_new_id() {
+            let dir = tempdir().unwrap();
+            // The claim file that was live at boot is gone (the old session
+            // ended); a NEW claim file for a fresh session has replaced it --
+            // exactly what a restart or compact produces.
+            write_claim(
+                dir.path(),
+                "sess-b",
+                "Overwatch",
+                "/cwd",
+                "2026-08-23T21:05:00Z",
+            );
+            let boot = SessionMarker::new("sess-a".to_string());
+            let result = recheck_live_session(dir.path(), "Overwatch", Some("/cwd"), &boot);
+            assert!(
+                result.is_some(),
+                "MUTATION TARGET: a genuinely different live session must be detected"
+            );
+            assert_eq!(
+                result.unwrap().log_fingerprint(),
+                SessionMarker::new("sess-b".to_string()).log_fingerprint()
+            );
+        }
+
+        #[test]
+        fn claim_dir_read_error_returns_none_not_a_false_divergence() {
+            let boot = SessionMarker::new("sess-a".to_string());
+            // A directory that does not exist: resolve_live_marker_from_claims
+            // errors. That must NOT be reported as a divergence -- a
+            // transient claim-dir hiccup must not crash-loop the daemon.
+            let result = recheck_live_session(
+                std::path::Path::new("/does/not/exist/at/all"),
+                "Overwatch",
+                Some("/cwd"),
+                &boot,
+            );
+            assert!(result.is_none(), "MUTATION TARGET: a read error must degrade to 'unchanged', never be treated as a confirmed divergence");
+        }
+
+        #[test]
+        fn both_boot_and_current_missing_returns_none() {
+            // No claim file for this role at all, boot marker never resolved
+            // either (mirrors main()'s live_marker being None -- but exercised
+            // directly here since recheck_live_session itself only receives a
+            // Some(boot) from main() when live_marker was already Some).
+            let dir = tempdir().unwrap();
+            let boot = SessionMarker::new("sess-a".to_string());
+            let result = recheck_live_session(dir.path(), "Overwatch", Some("/cwd"), &boot);
+            assert!(result.is_none());
         }
     }
 
