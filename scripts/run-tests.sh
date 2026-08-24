@@ -120,11 +120,15 @@ run_unit_tests() {
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
 
-  # Seat clerk read-bookmark gate: pure in-process session-marker decision
-  # logic (no infra). Mirrors the nextest path in `just test-unit` — the
-  # two lists must stay in step or the fallback silently covers less.
+  # Seat clerk gate: pure in-process session-marker decision logic, plus
+  # comms-orch#11's durable-log integration test (spawns a real throwaway
+  # `clerk` binary against an unreachable relay -- no docker, no live seat).
+  # Full invocation, not --lib-scoped, so that test actually runs;
+  # tests/integration_test.rs stays #[ignore]-gated (needs a live relay).
+  # Mirrors the nextest path in `just test-unit` — the two lists must stay
+  # in step or the fallback silently covers less.
   run_test_step "buzz-seat-clerk tests" \
-    cargo test -p buzz-seat-clerk --lib -- --nocapture
+    cargo test -p buzz-seat-clerk -- --nocapture
 
   # buzz#10 slice one: full invocation (not --lib-scoped — none of these
   # need that scoping). Mirrors the nextest path in `just test-unit` — the

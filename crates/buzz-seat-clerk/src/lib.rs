@@ -41,6 +41,7 @@ pub mod connection;
 pub mod discovery;
 pub mod error;
 pub mod lane;
+pub mod logging;
 pub mod mailbox;
 pub mod read_ack;
 pub mod read_state;

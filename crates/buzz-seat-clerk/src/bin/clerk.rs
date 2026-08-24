@@ -22,6 +22,10 @@ use buzz_seat_clerk::{
     connection::connect_with_backoff,
     discovery::{discover_channels, fetch_own_read_state, ChannelInfo, ChannelType},
     lane::{classify, Lane},
+    logging::{
+        append_log_line, clerk_log_path, format_startup_banner, resolve_git_commit,
+        resolve_seat_identity,
+    },
     mailbox::{Mailbox, MailboxEntry},
     read_ack::{parse_multi_channel_ack, parse_read_ack},
     read_state::{
@@ -47,6 +51,57 @@ async fn main() -> Result<()> {
 
     let cfg = ClerkConfig::from_env().context("load config")?;
     info!(pubkey = %cfg.public_key_hex, relay = %cfg.relay_url, "clerk starting");
+
+    // comms-orch#11 slice B: durable, size-capped, per-seat-attributable log file. Installed
+    // as early as possible -- right after cfg loads, since the log path itself is derived from
+    // the seat identity cfg carries -- so anything that goes wrong below this point has a
+    // fighting chance of leaving a trace on disk, not just in a terminal tab's scrollback.
+    let seat_identity = resolve_seat_identity(cfg.seat_role.as_deref(), &cfg.public_key_hex);
+    let log_path = clerk_log_path(&seat_identity);
+    let pid = std::process::id();
+    let repo_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let commit = resolve_git_commit(&repo_dir);
+    append_log_line(
+        &log_path,
+        &seat_identity,
+        &format_startup_banner(&commit, pid, &seat_identity),
+    );
+
+    // comms-orch#11 AC1: record why the process stopped. SIGTERM/SIGINT are logged, then this
+    // process exits 0 -- a graceful, supervisor-expected shutdown. SIGKILL cannot be caught by
+    // any process on any OS; that half of "why" can only come from whatever supervises this
+    // process (relaunch.sh, comms-orch#11 slice C), never from this binary. Not attempted here.
+    {
+        let log_path = log_path.clone();
+        let seat_identity = seat_identity.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("could not install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("could not install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    append_log_line(&log_path, &seat_identity, "received SIGTERM, exiting gracefully");
+                    std::process::exit(0);
+                }
+                _ = sigint.recv() => {
+                    append_log_line(&log_path, &seat_identity, "received SIGINT, exiting gracefully");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     // Resolve live session identity from fleet seat-claim files.
     // Feature is only active when SEAT_ROLE is set.

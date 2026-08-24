@@ -331,10 +331,14 @@ test-unit: test-unit-coverage-check
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
-        # Seat clerk read-bookmark gate: pure in-process session-marker
-        # decision logic (no infra). Guards the live-actor check that read
-        # bookmarks only advance for the live session.
-        cargo nextest run -p buzz-seat-clerk --lib
+        # Seat clerk gate: pure in-process session-marker decision logic
+        # (no infra), plus comms-orch#11's durable-log integration test
+        # (tests/co11b_durable_log.rs), which spawns a real throwaway
+        # `clerk` binary against an unreachable relay -- no docker, no live
+        # seat. Full invocation, not --lib-scoped, so that file actually
+        # runs; tests/integration_test.rs stays #[ignore]-gated (needs a
+        # live relay) and is skipped by default either way.
+        cargo nextest run -p buzz-seat-clerk
         # buzz#10 slice one: full invocation (not --lib-scoped — none of
         # these need that scoping; confirmed by running each crate's
         # complete suite with zero infra before wiring it here).
