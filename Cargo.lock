@@ -1377,6 +1377,7 @@ dependencies = [
  "buzz-core",
  "buzz-sdk",
  "buzz-ws-client",
+ "chrono",
  "hex",
  "nostr 0.44.7",
  "rand 0.10.1",
