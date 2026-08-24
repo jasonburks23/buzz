@@ -142,6 +142,20 @@ pub fn resolve_git_commit(repo_dir: &Path) -> String {
     Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)
+        // Overwatch gate-1 bounce (REV-20260823-01 class, same root as
+        // scripts/install-clerk.sh's b79467e15 fix in this same repo): `.current_dir()` only
+        // changes the working DIRECTORY. It does NOT override GIT_DIR/GIT_WORK_TREE/etc when
+        // those are ambient in the environment, and git sets GIT_DIR for every hook it invokes
+        // -- including this repo's own pre-push hook, which is exactly where this call was
+        // caught reading the WRONG repo's HEAD. This binary has no legitimate reason to inherit
+        // any of these; scrub them unconditionally so current_dir is actually authoritative.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_NAMESPACE")
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -311,6 +325,66 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let commit = resolve_git_commit(dir.path());
         assert_eq!(commit, "unknown");
+    }
+
+    // Overwatch gate-1 bounce: the test above only ever passed because the CI/dev-terminal
+    // environment happened to have no ambient GIT_DIR -- it was testing "nobody set GIT_DIR",
+    // not the fallback itself. This repo's own pre-push hook sets GIT_DIR for every hook it
+    // runs, and under that ambient env resolve_git_commit silently returned the PUSHED repo's
+    // real HEAD instead of "unknown" for a directory that is not a git repo at all -- a
+    // plausible wrong sha, strictly worse than an honest "unknown", on the exact field the
+    // clerk startup banner exists to answer ("what code am I running"). This test sets GIT_DIR
+    // DELIBERATELY to a real (throwaway, self-contained) repo and proves the fallback still
+    // fires for an unrelated non-git directory -- the actual effect the env_remove calls above
+    // exist to guarantee, not just "the fallback path is reachable somehow".
+    #[test]
+    fn resolve_git_commit_mutation_target_ignores_ambient_git_dir_for_a_non_git_dir() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        // This fixture's OWN setup calls need the exact same env_remove hardening as
+        // resolve_git_commit itself: this test proved that live, the hard way. Running this
+        // suite under the repo's real pre-push hook (which sets GIT_DIR ambiently for the whole
+        // process, including every test) with an unguarded `run()` here caused these setup
+        // commands to run against the REAL enclosing repo's object database instead of the decoy
+        // tempdir -- `git add -A; git commit` staged and committed against the ACTUAL git
+        // directory while cwd (and therefore the effective work tree) was this decoy dir,
+        // corrupting the real branch with a commit whose tree held only decoy.txt. Recovered via
+        // `git reset --hard` to the last known-good commit; never pushed. Clearing the same env
+        // vars here is what makes this fixture safe to run under a hook, which is the whole
+        // point of a test whose entire premise is "ambient GIT_DIR must not leak in".
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(decoy.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_CEILING_DIRECTORIES")
+                .env_remove("GIT_NAMESPACE")
+                .output()
+                .expect("git must be installed to run this test")
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "co11b-decoy@example.invalid"]);
+        run(&["config", "user.name", "co11b decoy"]);
+        fs::write(decoy.path().join("decoy.txt"), "decoy").unwrap();
+        run(&["add", "-A"]);
+        let commit_out = run(&["commit", "--quiet", "-m", "decoy commit"]);
+        assert!(
+            commit_out.status.success(),
+            "decoy repo commit must succeed: {commit_out:?}"
+        );
+
+        let non_git_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("GIT_DIR", decoy.path().join(".git"));
+        let commit = resolve_git_commit(non_git_dir.path());
+        std::env::remove_var("GIT_DIR");
+        assert_eq!(
+            commit, "unknown",
+            "MUTATION TARGET: an ambient GIT_DIR pointing at a REAL (decoy) repo must not leak that repo's HEAD into a non-git directory's resolved commit -- current_dir() alone does not override GIT_DIR, got: {commit}"
+        );
     }
 
     #[test]
