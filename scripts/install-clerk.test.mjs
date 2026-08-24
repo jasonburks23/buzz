@@ -198,3 +198,35 @@ test('VC-4: verify fails loud when the binary itself is missing', () => {
     assert.match(r.stderr, /no binary/);
   });
 });
+
+// REV-20260823-01 (root-caused own-hands by Overwatch/QA in opeff): `git -C <dir>` only changes
+// the working DIRECTORY. It does NOT override GIT_DIR/GIT_WORK_TREE/etc when those are ambient in
+// the environment, and git sets GIT_DIR for every hook it invokes. This reproduces that exact
+// incident shape against install-clerk.sh itself: an ambient GIT_DIR pointing at a DECOY repo
+// must not make `git -C "$REPO_ROOT" rev-parse HEAD` / `git diff` read the decoy.
+test('IC-8 (REV-20260823-01 repro, MUTATION TARGET): an ambient GIT_DIR pointing at a decoy repo does not leak into the recorded source_commit', () => {
+  withFixture(({ install, installDir, repo, headSha }) => {
+    // A second, unrelated git repo standing in for "whatever repo GIT_DIR happens to point at"
+    // -- e.g. a real checkout, if this script were ever invoked from inside one of its hooks.
+    const decoy = mkdtempSync(join(tmpdir(), 'install-clerk-decoy-'));
+    const runDecoy = (...args) => spawnSync('git', args, { cwd: decoy, encoding: 'utf8', env: { ...process.env, ...GIT_ENV }, timeout: HARD_TIMEOUT_MS });
+    runDecoy('init', '--quiet');
+    writeFileSync(join(decoy, 'decoy.txt'), 'decoy');
+    runDecoy('add', '-A');
+    runDecoy('commit', '--quiet', '-m', 'decoy commit');
+    const decoyHead = runDecoy('rev-parse', 'HEAD').stdout.trim();
+
+    const realHead = headSha();
+    assert.notEqual(decoyHead, realHead, 'sanity: the decoy and real repo must have different HEADs, or this test proves nothing');
+
+    // Simulate the exact incident vector: GIT_DIR ambient in the environment, pointing at the
+    // decoy's .git, while install-clerk.sh is invoked with cwd/REPO_ROOT set to the real fixture.
+    const r = install({ GIT_DIR: join(decoy, '.git') });
+    assert.equal(r.status, 0, r.stderr);
+    const recorded = readFileSync(join(installDir, 'clerk.sha256'), 'utf8');
+    assert.match(recorded, new RegExp(`^source_commit: ${realHead}\\b`, 'm'), 'MUTATION TARGET: recorded source_commit must be the REAL repo\'s HEAD, never the ambient-GIT_DIR decoy\'s');
+    assert.doesNotMatch(recorded, new RegExp(decoyHead), 'must never record the decoy repo\'s HEAD');
+
+    rmSync(decoy, { recursive: true, force: true });
+  });
+});

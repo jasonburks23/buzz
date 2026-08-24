@@ -12,6 +12,15 @@
 # checksum); re-running after a source change replaces the binary and checksum atomically.
 set -euo pipefail
 
+# REV-20260823-01 (root-caused own-hands by Overwatch/QA in opeff, see
+# scripts/lib/hermetic-git-env.mjs there): `git -C <dir>` only changes the working DIRECTORY. It
+# does NOT override GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/GIT_OBJECT_DIRECTORY/GIT_COMMON_DIR/
+# GIT_NAMESPACE when those are set in the environment -- and git SETS GIT_DIR for every hook it
+# invokes. If this script is ever called from a hook, or from anything with GIT_DIR ambient, the
+# `git -C "$REPO_ROOT"` calls below would silently read/diff the WRONG repository. Unset them
+# unconditionally before those calls; this script has no legitimate reason to inherit them.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_NAMESPACE
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="${1:-${CLERK_INSTALL_DIR:-$HOME/.local/agencyos/bin}}"
 BIN_NAME="clerk"
