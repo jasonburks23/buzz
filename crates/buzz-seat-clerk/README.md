@@ -71,19 +71,31 @@ cargo test -p buzz-seat-clerk
 
 The `support/` directory contains two process-supervision templates:
 
-- `com.civilization.buzz-seat-clerk.plist` (macOS launchd)
+- `com.civilization.buzz-seat-clerk.plist` (macOS launchd, single seat)
 - `buzz-seat-clerk.service` (Linux systemd)
 
-Load the launchd plist with:
+For a single seat, edit the template plist directly. Replace
+`REPLACE_WITH_YOUR_INSTALLED_CLERK_PATH` with wherever your build actually put
+the binary, and `REPLACE_WITH_BECH32_NSEC` with the seat secret loaded from
+KeychainAccess or a secrets manager -- never commit or hardcode the actual
+nsec value. Then:
 
 ```
 cp support/com.civilization.buzz-seat-clerk.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.civilization.buzz-seat-clerk.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.civilization.buzz-seat-clerk.plist
 ```
 
-Edit the plist before loading. Replace `REPLACE_WITH_BECH32_NSEC` with the
-seat secret loaded from KeychainAccess or a secrets manager. Never commit or
-hardcode the actual nsec value.
+**For several seats** (comms-orch#18): each clerk carries its own identity via
+environment, so N seats means N launchd jobs, never one shared job. Hand-editing
+N copies of the template does not scale and risks a copy-paste identity leak.
+`scripts/generate-clerk-launchd.sh` generates one correctly-scoped plist +
+wrapper script per seat from a fleet registry (`SEAT_REGISTRY_PATH`), pointing
+at the canonical installed binary (`scripts/install-clerk.sh`'s
+`~/.local/agencyos/bin/clerk`), and never writes a secret value into any
+generated file -- only the source seat's env-var *name*, resolved at the
+wrapper's own run time. It only writes files; loading the generated plists
+into `~/Library/LaunchAgents` and running `launchctl bootstrap` is a separate,
+deliberate operator step (see the script's own trailing instructions).
 
 For systemd, copy the env template to `/etc/buzz-seat-clerk/env`, populate
 `SEAT_NSEC` and `RELAY_URL` there, then:

@@ -8,8 +8,15 @@
 
   <key>ProgramArguments</key>
   <array>
-    <!-- Replace with actual binary path after `cargo install` or `cargo build --release`. -->
-    <string>/usr/local/bin/clerk</string>
+    <!-- SINGLE-SEAT TEMPLATE, not a deployable artifact as-is: `/usr/local/bin/clerk` is a
+         placeholder, not a real path this repo ever installs to. Replace it with wherever your
+         `cargo build --release -p buzz-seat-clerk --bin clerk` (or scripts/install-clerk.sh)
+         actually put the binary -- e.g. `target/release/clerk`, or `~/.local/agencyos/bin/clerk`
+         if you used install-clerk.sh. For running SEVERAL seats' clerks (one launchd job per
+         seat, since each carries its own identity), use scripts/generate-clerk-launchd.sh
+         instead of hand-editing this file -- it generates one correct plist + wrapper per seat
+         from a fleet registry. -->
+    <string>REPLACE_WITH_YOUR_INSTALLED_CLERK_PATH</string>
   </array>
 
   <key>EnvironmentVariables</key>
