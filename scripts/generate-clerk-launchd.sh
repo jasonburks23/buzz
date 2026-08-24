@@ -58,7 +58,18 @@ ENVLOCAL=$(python3 -c "import json;d=json.load(open('$REG'));print(d['fleet_boot
 RELAY=$(python3 -c "import json;d=json.load(open('$REG'));print(d['buzz']['relayUrl'])")
 WSRELAY=$(python3 -c "import json;d=json.load(open('$REG'));b=d['buzz'];print(b.get('relayWsUrl') or b['relayUrl'].replace('https:','wss:'))")
 
-bootable_aliases(){
+# 2026-08-24 roster restructure (Overwatch, pre-gate-1 on this ticket): CC seats came off comms
+# entirely (no more room -> buzzChannels empty), and new TP seats can land in the registry with a
+# placeholder pubkey and NO real key in envLocal before their credential is provisioned. Both are
+# EXPECTED, ongoing states, not errors -- but a generator that silently drops such a row is the
+# exact "landed a file, changed nothing, and nobody could tell why" defect class this ticket
+# exists to close. seat_status classifies every aliased row (not just the bootable ones) and
+# prints a reason, so a caller can report LOUD why each row that did NOT get a job was skipped,
+# by name, instead of the row just silently vanishing from the output.
+#   alias<TAB>STATUS<TAB>keyvar_name
+#   STATUS: BOOTABLE | NO_CHANNELS (not in any room -- retired/dormant) | NO_KEY (no real
+#   credential in envLocal for this row's buzzKeyEnvVar, or buzzKeyEnvVar itself unset)
+seat_status(){
   python3 - "$REG" "$ENVLOCAL" <<'PY'
 import json,sys,re
 reg=json.load(open(sys.argv[1]))
@@ -75,8 +86,19 @@ def keyok(kv):
     if not kv: return False
     m=re.search(r'(?m)^\s*(?:export\s+)?%s=(.*)$'%re.escape(kv),envtext)
     return bool(m and m.group(1).strip().strip('"').strip("'"))
-print(" ".join(r['alias'] for r in (find_rows(reg) or [])
-      if r.get('alias') and keyok(r.get('buzzKeyEnvVar')) and r.get('buzzChannels')))
+for r in (find_rows(reg) or []):
+    alias = r.get('alias')
+    if not alias:
+        continue
+    has_channels = bool(r.get('buzzChannels'))
+    kv = r.get('buzzKeyEnvVar')
+    if not has_channels:
+        status = 'NO_CHANNELS'
+    elif not keyok(kv):
+        status = 'NO_KEY'
+    else:
+        status = 'BOOTABLE'
+    print("%s\t%s\t%s" % (alias, status, kv or '(unset)'))
 PY
 }
 
@@ -107,31 +129,51 @@ PY
 mkdir -p "$DEPLOY_DIR"
 
 GENERATED=()
-for alias in $(bootable_aliases); do
-  eval "$(seat_facts "$alias")"
-  wrapper_path="$DEPLOY_DIR/$(clerk_wrapper_filename "$alias")"
-  plist_path="$DEPLOY_DIR/$(clerk_plist_filename "$alias")"
-  label=$(clerk_plist_label "$alias")
-  stdout_path=$(clerk_launchd_stdout_path "$CLERK_LOG_DIR" "$alias")
-  stderr_path=$(clerk_launchd_stderr_path "$CLERK_LOG_DIR" "$alias")
+SKIPPED_NO_CHANNELS=()
+SKIPPED_NO_KEY=()
+while IFS=$'\t' read -r alias status keyvar_name; do
+  [ -z "$alias" ] && continue
+  case "$status" in
+    BOOTABLE)
+      eval "$(seat_facts "$alias")"
+      wrapper_path="$DEPLOY_DIR/$(clerk_wrapper_filename "$alias")"
+      plist_path="$DEPLOY_DIR/$(clerk_plist_filename "$alias")"
+      label=$(clerk_plist_label "$alias")
+      stdout_path=$(clerk_launchd_stdout_path "$CLERK_LOG_DIR" "$alias")
+      stderr_path=$(clerk_launchd_stderr_path "$CLERK_LOG_DIR" "$alias")
 
-  render_clerk_wrapper_script "$CLERK_BIN" "$ENVLOCAL" "$KEYVAR" "$WSRELAY" "$ROLE" \
-    "$SESSION" "$WAKE" "$READACK" "/tmp" "$CLERK_LOG_DIR" > "$wrapper_path"
-  chmod +x "$wrapper_path"
+      render_clerk_wrapper_script "$CLERK_BIN" "$ENVLOCAL" "$KEYVAR" "$WSRELAY" "$ROLE" \
+        "$SESSION" "$WAKE" "$READACK" "/tmp" "$CLERK_LOG_DIR" > "$wrapper_path"
+      chmod +x "$wrapper_path"
 
-  render_clerk_plist "$label" "$wrapper_path" "$stdout_path" "$stderr_path" > "$plist_path"
+      render_clerk_plist "$label" "$wrapper_path" "$stdout_path" "$stderr_path" > "$plist_path"
 
-  echo "generate-clerk-launchd: wrote $plist_path (wrapper: $wrapper_path)"
-  GENERATED+=("$plist_path")
-done
+      echo "generate-clerk-launchd: wrote $plist_path (wrapper: $wrapper_path)"
+      GENERATED+=("$plist_path")
+      ;;
+    NO_CHANNELS)
+      # Expected, ongoing state (2026-08-24 roster restructure: CC seats came off comms entirely)
+      # -- not an error, but never silent: a retired seat that stops getting a clerk must say why.
+      echo "generate-clerk-launchd: SKIP $alias -- not in any room (buzzChannels empty); retired or dormant seat, refusing to generate a clerk job" >&2
+      SKIPPED_NO_CHANNELS+=("$alias")
+      ;;
+    NO_KEY)
+      # Expected, ongoing state (new TP seats can land with a placeholder pubkey before their
+      # credential is provisioned) -- refuse LOUD by name, never emit a plist that would load with
+      # an empty/missing key.
+      echo "generate-clerk-launchd: SKIP $alias -- NO KEY CONFIGURED (buzzKeyEnvVar='$keyvar_name' has no real value in envLocal); refusing to generate a clerk job with no credential" >&2
+      SKIPPED_NO_KEY+=("$alias")
+      ;;
+  esac
+done < <(seat_status)
 
 if [ "${#GENERATED[@]}" -eq 0 ]; then
-  echo "generate-clerk-launchd: no bootable seats found in $REG -- nothing generated" >&2
+  echo "generate-clerk-launchd: no bootable seats found in $REG -- nothing generated (${#SKIPPED_NO_CHANNELS[@]} skipped: no channels, ${#SKIPPED_NO_KEY[@]} skipped: no key -- see reasons above)" >&2
   exit 1
 fi
 
 echo
-echo "generate-clerk-launchd: ${#GENERATED[@]} job(s) written to $DEPLOY_DIR"
+echo "generate-clerk-launchd: ${#GENERATED[@]} job(s) written to $DEPLOY_DIR (${#SKIPPED_NO_CHANNELS[@]} skipped: no channels, ${#SKIPPED_NO_KEY[@]} skipped: no key)"
 echo "Next (operator hands -- this script does not do this):"
 for p in "${GENERATED[@]}"; do
   b=$(basename "$p")

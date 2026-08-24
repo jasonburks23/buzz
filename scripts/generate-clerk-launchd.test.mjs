@@ -48,7 +48,8 @@ function makeFixture({ withClerkBin = true } = {}) {
         buzzChannels: ["general"],
       },
       {
-        // Not bootable: no buzzChannels -- must be skipped entirely.
+        // Not bootable: no buzzChannels -- 2026-08-24 roster restructure shape (a CC seat taken
+        // off comms entirely). Must be skipped, loud, by name -- never silently.
         alias: "dormant-seat",
         role: "AgencyOS-Dormant",
         tabName: "Dormant",
@@ -56,6 +57,18 @@ function makeFixture({ withClerkBin = true } = {}) {
         sessionId: "sess-xyz",
         tpRole: "dormant",
         buzzChannels: [],
+      },
+      {
+        // Not bootable: has a room, but buzzKeyEnvVar points at a var envLocal never defines --
+        // the 2026-08-24 new-TP-seat shape (placeholder pubkey, no real key provisioned yet).
+        // Must refuse loud, by name, never emit a plist that would load with an empty key.
+        alias: "new-tp-seat",
+        role: "AgencyOS-NewTP",
+        tabName: "NewTP",
+        buzzKeyEnvVar: "NEWTP_NSEC_NOT_YET_PROVISIONED",
+        sessionId: "sess-newtp",
+        tpRole: "newtp",
+        buzzChannels: ["general"],
       },
     ],
   };
@@ -115,6 +128,65 @@ test("GCL-1 (MUTATION TARGET): generates exactly one plist + wrapper for the boo
     ),
     "MUTATION TARGET: a non-bootable seat (no buzzChannels) must not get a job",
   );
+  assert.ok(
+    !existsSync(
+      join(f.deployDir, "com.civilization.buzz-seat-clerk-new-tp-seat.plist"),
+    ),
+    "MUTATION TARGET: a seat with no real key must not get a job",
+  );
+});
+
+test("GCL-6 (MUTATION TARGET): a retired (no-channels) seat is skipped LOUD, by name, with a named reason -- never silently", () => {
+  const f = makeFixture();
+  const r = run(f);
+  assert.equal(
+    r.status,
+    0,
+    `expected overall success (one bootable seat), got:\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(
+    r.stderr,
+    /SKIP dormant-seat/,
+    `MUTATION TARGET: stderr must name the skipped seat, got:\n${r.stderr}`,
+  );
+  assert.match(
+    r.stderr,
+    /dormant-seat.*not in any room/i,
+    `MUTATION TARGET: stderr must name WHY, got:\n${r.stderr}`,
+  );
+});
+
+test("GCL-7 (MUTATION TARGET): a seat with no real key is skipped LOUD, by name, with a named reason -- never silently, and never with an empty-key plist", () => {
+  const f = makeFixture();
+  const r = run(f);
+  assert.equal(
+    r.status,
+    0,
+    `expected overall success (one bootable seat), got:\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.match(
+    r.stderr,
+    /SKIP new-tp-seat/,
+    `MUTATION TARGET: stderr must name the skipped seat, got:\n${r.stderr}`,
+  );
+  assert.match(
+    r.stderr,
+    /new-tp-seat.*NO KEY CONFIGURED/i,
+    `MUTATION TARGET: stderr must name WHY (no key), got:\n${r.stderr}`,
+  );
+});
+
+test("GCL-8: a mixed roster (one bootable, one retired, one unprovisioned) generates exactly the bootable seat and reports accurate skip counts", () => {
+  const f = makeFixture();
+  const r = run(f);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(
+    r.stdout,
+    /1 job\(s\) written/,
+    `expected exactly 1 job written, got:\n${r.stdout}`,
+  );
+  assert.match(r.stdout, /1 skipped: no channels/, r.stdout);
+  assert.match(r.stdout, /1 skipped: no key/, r.stdout);
 });
 
 test("GCL-2: the generated plist points ProgramArguments at the wrapper, with RunAtLoad+KeepAlive true", () => {
