@@ -81,12 +81,20 @@ services:
       KC_DB: dev-mem
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
+      # buzz#20 fix: Keycloak 26 only serves /health/ready when explicitly
+      # enabled, and then only on the management port (9000), never on the
+      # main HTTP port. Without this, the healthcheck below could not pass
+      # under any configuration -- verified live: an unmodified container
+      # returns HTTP 400 on 8080/health/ready and refuses 9000 outright
+      # (the management interface never starts), and a throwaway container
+      # with this var set returns a real 200 OK on 9000/health/ready.
+      KC_HEALTH_ENABLED: "true"
     ports:
       - "127.0.0.1:8180:8080"
     networks:
       - buzz-net
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
       interval: 10s
       timeout: 5s
       retries: 15
