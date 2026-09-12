@@ -45,6 +45,15 @@ impl SessionMarker {
             s
         }
     }
+
+    /// Return the raw session-id string.
+    ///
+    /// Used by the send-side stamp (US-01/#293) to embed the live marker as a
+    /// Nostr tag value. Display intentionally hides the id; this accessor gives
+    /// the send path the raw value it needs to build the tag.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SessionMarker {
