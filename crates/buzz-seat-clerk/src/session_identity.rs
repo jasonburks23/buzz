@@ -30,6 +30,21 @@ impl SessionMarker {
     pub fn new(id: String) -> Self {
         Self(id)
     }
+
+    /// Short, log-safe fingerprint: the last 8 characters of the id (or the
+    /// whole id if shorter). `Debug`/`Display` stay fully masked on purpose
+    /// (see the type doc); this exists ONLY for diagnostics that need to
+    /// show two markers are DIFFERENT without fully exposing either one --
+    /// e.g. logging "session changed from ...abcd1234 to ...ef567890" when
+    /// the clerk exits for a live-session restart (comms-orch#24 item 3).
+    pub fn log_fingerprint(&self) -> &str {
+        let s = &self.0;
+        if s.len() > 8 {
+            &s[s.len() - 8..]
+        } else {
+            s
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionMarker {
@@ -248,6 +263,37 @@ mod tests {
 
     fn live() -> SessionMarker {
         SessionMarker("live-session-uuid-1234".to_string())
+    }
+
+    // comms-orch#24 item 3: log_fingerprint must never return the full id
+    // (that defeats the masking Debug/Display already enforce), but two
+    // DIFFERENT markers must produce DIFFERENT fingerprints so a log line
+    // can actually distinguish "changed from X to Y".
+    #[test]
+    fn log_fingerprint_is_short_and_distinguishes_different_markers() {
+        let a = SessionMarker("aaaaaaaa-1111-2222-3333-444444440001".to_string());
+        let b = SessionMarker("bbbbbbbb-1111-2222-3333-444444440002".to_string());
+        assert_eq!(
+            a.log_fingerprint().len(),
+            8,
+            "MUTATION: fingerprint must be truncated, not the full id"
+        );
+        assert_ne!(
+            a.log_fingerprint(),
+            b.log_fingerprint(),
+            "two different markers must produce different fingerprints"
+        );
+        assert_ne!(
+            a.log_fingerprint(),
+            a.0,
+            "the fingerprint must never equal the full raw id"
+        );
+    }
+
+    #[test]
+    fn log_fingerprint_of_a_short_id_returns_the_whole_thing() {
+        let m = SessionMarker("abc".to_string());
+        assert_eq!(m.log_fingerprint(), "abc");
     }
 
     // Scenario 1: Read event stamped with the live marker matches.
