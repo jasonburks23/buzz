@@ -1,0 +1,83 @@
+#!/usr/bin/env node
+/**
+ * .githooks/commit-msg
+ *
+ * Blocks or warns when a commit message uses a GitHub closing keyword
+ * (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved)
+ * in a way that would auto-close a GitHub issue on the default branch.
+ *
+ * Two cases:
+ *   BLOCK (exit 1): the keyword targets an issue AND a scope qualifier
+ *     follows the number (e.g. "Closes #350 runner-up"). GitHub silently
+ *     ignores the qualifier and closes the WHOLE issue. Use "part of #N"
+ *     to reference a sub-part without triggering auto-close.
+ *
+ *   WARN (exit 0 with stderr): a bare keyword targets an issue number
+ *     (e.g. "Fixes #42"). This WILL auto-close issue #42 on merge to the
+ *     default branch. Not always wrong, but worth confirming intent.
+ *
+ * Installed via scripts/install-hooks.sh (sets core.hooksPath=.githooks).
+ *
+ * Piece 3 of opeff#350 G2 resilience build.
+ */
+
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// Resolve the lib path relative to this hook file regardless of cwd.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const libPath = join(__dirname, '..', 'scripts', 'lib', 'commit-close-keyword.mjs');
+
+// Dynamic import so the hook runs as an ES module without a package.json change.
+const { classifyCommitCloseKeyword } = await import(libPath);
+
+// Git passes the path to the commit message file as the first argument.
+const msgFile = process.argv[2];
+if (!msgFile) {
+  // No file path provided: not a normal git commit-msg invocation. Exit clean.
+  process.exit(0);
+}
+
+let message;
+try {
+  message = readFileSync(msgFile, 'utf8');
+} catch (e) {
+  process.stderr.write(`commit-msg hook: could not read message file: ${e.message}\n`);
+  process.exit(0); // Fail-open: do not block a commit over a hook read error.
+}
+
+const { block, warn, matches } = classifyCommitCloseKeyword(message);
+
+if (block) {
+  process.stderr.write('\n');
+  process.stderr.write('COMMIT BLOCKED by commit-msg hook (opeff#350 G2).\n');
+  process.stderr.write('\n');
+  process.stderr.write('Your commit message contains a closing keyword with a scope qualifier:\n');
+  for (const { keyword, issue, qualifier } of matches.filter(m => m.qualifier)) {
+    process.stderr.write(`  "${keyword} #${issue} ${qualifier}"\n`);
+    process.stderr.write(
+      `  GitHub IGNORES the qualifier "${qualifier}" and will close issue #${issue} entirely\n` +
+      '  when this branch merges to the default branch.\n'
+    );
+    process.stderr.write('\n');
+    process.stderr.write(`  To reference a sub-part, use:  part of #${issue}\n`);
+    process.stderr.write(`  To close intentionally, use:   Closes #${issue}\n`);
+  }
+  process.stderr.write('\n');
+  process.exit(1);
+}
+
+if (warn) {
+  for (const { keyword, issue, qualifier } of matches.filter(m => m.qualifier === null)) {
+    process.stderr.write(
+      `commit-msg warning: "${keyword} #${issue}" will auto-close issue #${issue} on merge ` +
+      `to the default branch. If #${issue} is an epic or this is a partial delivery, ` +
+      `use "part of #${issue}" instead.\n`
+    );
+  }
+  // warn exits 0: informational only.
+}
+
+process.exit(0);

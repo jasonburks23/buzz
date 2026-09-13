@@ -1,0 +1,12 @@
+#!/bin/sh
+# AgencyOS shared pre-push hook: non-blocking drift warning. Issue #33.
+BEHIND_WARN=40
+cur=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if git rev-parse --verify origin/main >/dev/null 2>&1; then
+  behind=$(git rev-list --count "${cur}..origin/main" 2>/dev/null || echo 0)
+  if [ "${behind:-0}" -gt "$BEHIND_WARN" ]; then
+    echo "pre-push WARNING: '$cur' is $behind commits behind origin/main."
+    echo "  Consider: git rebase origin/main (a branch should merge or die, not drift)."
+  fi
+fi
+exit 0
