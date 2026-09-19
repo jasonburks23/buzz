@@ -130,28 +130,11 @@ impl NostrWsConnection {
             return Ok(msg);
         }
 
-        loop {
-            let raw = timeout(timeout_dur, self.ws.next())
-                .await
-                .map_err(|_| WsClientError::Timeout)?
-                .ok_or(WsClientError::ConnectionClosed)?
-                .map_err(WsClientError::WebSocket)?;
-
-            match raw {
-                Message::Text(text) => {
-                    let msg = parse_relay_message(&text)?;
-                    if let RelayMessage::Auth { ref challenge } = msg {
-                        self.pending_challenge = Some(challenge.clone());
-                    }
-                    return Ok(msg);
-                }
-                Message::Ping(data) => {
-                    self.ws.send(Message::Pong(data)).await?;
-                }
-                Message::Close(_) => return Err(WsClientError::ConnectionClosed),
-                _ => {}
-            }
+        let msg = recv_with_deadline(&mut self.ws, timeout_dur).await?;
+        if let RelayMessage::Auth { ref challenge } = msg {
+            self.pending_challenge = Some(challenge.clone());
         }
+        Ok(msg)
     }
 
     async fn wait_for_auth_challenge(
@@ -269,6 +252,46 @@ impl NostrWsConnection {
     }
 }
 
+/// Waits up to `timeout_dur`, total, for the next Text frame on `ws`, replying
+/// to any Ping with a Pong along the way.
+///
+/// opeff#1196: the deadline is computed once, before the loop, and every pass
+/// waits only for what is left of it. A non-Text frame (Ping, Pong, Binary,
+/// ...) is handled and the loop continues, but it never grants the wait a
+/// fresh `timeout_dur`; only silence advances the clock toward `Timeout`. A
+/// per-frame `timeout(timeout_dur, ws.next())` inside this loop looks
+/// equivalent but is not: a relay (or a test double) sending a control frame
+/// more often than `timeout_dur` never lets that form return, Text or
+/// Timeout, at all.
+async fn recv_with_deadline<S>(
+    ws: &mut S,
+    timeout_dur: Duration,
+) -> Result<RelayMessage, WsClientError>
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+
+    loop {
+        let raw = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .map_err(|_| WsClientError::Timeout)?
+            .ok_or(WsClientError::ConnectionClosed)?
+            .map_err(WsClientError::WebSocket)?;
+
+        match raw {
+            Message::Text(text) => return Ok(parse_relay_message(&text)?),
+            Message::Ping(data) => {
+                ws.send(Message::Pong(data)).await?;
+            }
+            Message::Close(_) => return Err(WsClientError::ConnectionClosed),
+            _ => {}
+        }
+    }
+}
+
 /// One-shot helper: connect, authenticate, send one event, disconnect.
 ///
 /// Establishes a fresh WebSocket connection, completes NIP-42 authentication,
@@ -296,6 +319,8 @@ pub async fn publish_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     #[test]
     fn auth_challenge_timeout_meets_floor() {
@@ -310,5 +335,82 @@ mod tests {
     #[test]
     fn publish_ok_timeout_meets_floor() {
         const { assert!(PUBLISH_OK_TIMEOUT_SECS >= 30) };
+    }
+
+    /// A fake relay transport that never sends Text, only a Ping every
+    /// `period`, forever. Stands in for `WsStream` in `recv_with_deadline` so
+    /// the deadline behavior can be tested without a real socket.
+    struct PingOnlyStream {
+        ticker: tokio::time::Interval,
+    }
+
+    impl PingOnlyStream {
+        fn new(period: Duration) -> Self {
+            Self {
+                ticker: tokio::time::interval(period),
+            }
+        }
+    }
+
+    impl futures_util::Stream for PingOnlyStream {
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.ticker
+                .poll_tick(cx)
+                .map(|_| Some(Ok(Message::Ping(Vec::new().into()))))
+        }
+    }
+
+    impl futures_util::Sink<Message> for PingOnlyStream {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            // The Pong reply is dropped on the floor; this double only cares
+            // about what recv_with_deadline does with the read side.
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // opeff#1196: with paused virtual time, this proves the deadline shape
+    // itself, not just that a Ping gets a Pong. A stream emitting a Ping
+    // every 100 ms and never a Text frame must still return Timeout once
+    // timeout_dur has elapsed, plus a small slack for the tick and Pong
+    // bookkeeping in between. Mutation note: reverting recv_with_deadline to
+    // the old per-frame form, `timeout(timeout_dur, ws.next())` called fresh
+    // inside the loop instead of `timeout_at(deadline, ...)` against a
+    // deadline computed once, makes this test hang: every 100 ms Ping arrives
+    // before the 350 ms timeout_dur can ever elapse, so the wait resets
+    // forever and neither Timeout nor any other result is ever produced.
+    #[tokio::test(start_paused = true)]
+    async fn ping_only_stream_times_out_without_resetting_deadline() {
+        let mut stream = PingOnlyStream::new(Duration::from_millis(100));
+        let timeout_dur = Duration::from_millis(350);
+        let slack = Duration::from_millis(150);
+
+        let start = tokio::time::Instant::now();
+        let result = recv_with_deadline(&mut stream, timeout_dur).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(WsClientError::Timeout)),
+            "expected Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed >= timeout_dur && elapsed <= timeout_dur + slack,
+            "elapsed {elapsed:?} should land within {slack:?} of timeout_dur {timeout_dur:?}"
+        );
     }
 }

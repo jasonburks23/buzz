@@ -1383,4 +1383,122 @@ mod tests {
             );
         }
     } // mod timer_guard
+
+    // =========================================================================
+    // opeff#1196 clerk-level test, US21-T5 shape.
+    //
+    // The buzz half of #1196 fixed `NostrWsConnection::next_event` so a
+    // relay sending only control frames (Ping, Pong, Binary, ...) can no
+    // longer reset its wait forever. This proves that fix from the clerk's
+    // side of the wire: a real `NostrWsConnection` talking to a local relay
+    // double that sends nothing but Pings still lets the tick loop advance
+    // on the timeout clock, so `write_heartbeat` -- called once per tick,
+    // right before the `next_event` wait, exactly as in `main()`'s event
+    // loop -- lands more than once inside three ticks.
+    //
+    // Before the fix this test hangs: a Ping arriving faster than the
+    // per-tick timeout kept `recv_one`'s old form waiting forever, so
+    // `next_event` never returned and the loop below never reached its
+    // second iteration.
+    // =========================================================================
+    mod control_frame_tick {
+        use super::*;
+        use buzz_ws_client::NostrWsConnection;
+        use futures_util::SinkExt;
+        use std::collections::HashSet;
+        use std::time::Instant;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        /// Accepts one connection and sends nothing but a Ping every `period`,
+        /// forever. No Text frame is ever sent, so this stands in for the
+        /// live relay's control-frame chatter with the one property that
+        /// matters here: the clerk never gets a message to act on.
+        async fn spawn_ping_only_relay(period: Duration) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut ws = accept_async(stream).await.expect("ws handshake");
+                loop {
+                    tokio::time::sleep(period).await;
+                    if ws.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            format!("ws://{addr}")
+        }
+
+        #[tokio::test]
+        async fn control_frames_only_still_produce_heartbeats_on_schedule() {
+            // Pings arrive far faster than the per-tick timeout below, the
+            // exact shape Holdout's andon reported (a control frame every
+            // few seconds against a 30 s tick): if any single frame reset
+            // the wait, this relay would keep every next_event call pending
+            // forever.
+            let ping_period = Duration::from_millis(15);
+            let tick_timeout = Duration::from_millis(80);
+            let url = spawn_ping_only_relay(ping_period).await;
+
+            let mut conn = NostrWsConnection::connect(&url)
+                .await
+                .expect("connect to fake relay");
+
+            let dir = tempdir().unwrap();
+            let heartbeat_path = dir.path().join("heartbeat");
+            let heartbeat_path = heartbeat_path.to_str().unwrap();
+
+            let mut observed_ts = Vec::new();
+            let start = Instant::now();
+            for _ in 0..3u64 {
+                // Same shape as main()'s event loop: write the heartbeat
+                // unconditionally, then block on next_event. A Timeout is not
+                // an error here, it is the expected outcome every tick, and
+                // the loop keeps going either way (see `should_reconnect`
+                // returning false for WsClientError::Timeout, above).
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                write_heartbeat(heartbeat_path, Some("Ops"), now).expect("write_heartbeat");
+                observed_ts.push(now);
+
+                let _ = conn.next_event(tick_timeout).await;
+            }
+            let elapsed = start.elapsed();
+
+            // Non-vacuity: three ticks against a relay that only ever sends
+            // control frames must take roughly 3 * tick_timeout, not return
+            // instantly (which would mean the loop below isn't exercising
+            // next_event's wait at all) and not hang (which is exactly what
+            // the pre-fix per-frame timeout did against this relay).
+            assert!(
+                elapsed >= tick_timeout * 2,
+                "3 ticks completed in {elapsed:?}, too fast to have actually \
+                 waited on next_event; this test would not catch the bug"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "3 ticks against a control-frame-only relay took {elapsed:?}; \
+                 the pre-fix per-frame timeout hangs here forever"
+            );
+
+            let unique: HashSet<_> = observed_ts.iter().collect();
+            assert!(
+                unique.len() >= 2,
+                "US21-T5 (clerk-level): expected at least 2 distinct heartbeat \
+                 writes across 3 ticks, got {observed_ts:?}"
+            );
+
+            let raw = std::fs::read_to_string(heartbeat_path).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                parsed["ts"].as_u64(),
+                observed_ts.last().copied(),
+                "heartbeat file must hold the last tick's write"
+            );
+        }
+    }
 }
