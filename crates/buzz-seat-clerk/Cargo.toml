@@ -36,4 +36,6 @@ hex            = { workspace = true }
 tempfile       = "3"
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "net"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
