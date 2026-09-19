@@ -412,6 +412,7 @@ mod tests {
             public_key_hex: String::new(),
             relay_url: String::new(),
             wake_file: String::new(),
+            heartbeat_file: String::new(),
             seat_role: None,
             seat_cwd: None,
             readack_file: String::new(),

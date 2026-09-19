@@ -16,6 +16,12 @@ pub struct ClerkConfig {
     pub public_key_hex: String,
     pub relay_url: String,
     pub wake_file: String,
+    /// opeff#1196: path for the per-tick liveness heartbeat, written whether
+    /// or not any mail arrived. Defaults to `wake_file` with "wake" replaced
+    /// by "heartbeat" (see `heartbeat::default_heartbeat_path`) so no new env
+    /// var needs plumbing through launch-clerk.sh, the tab-clerk generator,
+    /// or relaunch.sh -- they already resolve and export WAKE_FILE per seat.
+    pub heartbeat_file: String,
     /// Fleet seat role (e.g. `"AgencyOS-CC-Alpha"`).  When `Some`, the honest
     /// read-receipt feature is active.  When `None`, the feature is disabled.
     pub seat_role: Option<String>,
@@ -39,6 +45,7 @@ impl std::fmt::Debug for ClerkConfig {
             .field("public_key_hex", &self.public_key_hex)
             .field("relay_url", &self.relay_url)
             .field("wake_file", &self.wake_file)
+            .field("heartbeat_file", &self.heartbeat_file)
             .field("seat_role", &self.seat_role)
             .field("seat_cwd", &self.seat_cwd)
             .field("readack_file", &self.readack_file)
@@ -61,6 +68,8 @@ impl ClerkConfig {
             std::env::var("RELAY_URL").map_err(|_| ClerkError::MissingEnv("RELAY_URL".into()))?;
         let wake_file =
             std::env::var("WAKE_FILE").unwrap_or_else(|_| "/tmp/buzz-seat-clerk.wake".into());
+        let heartbeat_file = std::env::var("HEARTBEAT_FILE")
+            .unwrap_or_else(|_| crate::heartbeat::default_heartbeat_path(&wake_file));
 
         let secret_key =
             SecretKey::from_bech32(&nsec_str).map_err(|e| ClerkError::InvalidKey(e.to_string()))?;
@@ -93,6 +102,7 @@ impl ClerkConfig {
             public_key_hex,
             relay_url,
             wake_file,
+            heartbeat_file,
             seat_role,
             seat_cwd,
             readack_file,

@@ -482,6 +482,7 @@ async fn read_state_survives_restart_via_relay_load() {
         public_key_hex: seat_pubkey_hex.clone(),
         relay_url: relay_url(),
         wake_file: dir.path().join("ignored.wake").display().to_string(),
+        heartbeat_file: dir.path().join("ignored.heartbeat").display().to_string(),
         seat_role: None,
         seat_cwd: None,
         readack_file: dir.path().join("ignored.readack").display().to_string(),
