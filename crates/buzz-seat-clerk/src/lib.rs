@@ -40,6 +40,7 @@ pub mod config;
 pub mod connection;
 pub mod discovery;
 pub mod error;
+pub mod heartbeat;
 pub mod lane;
 pub mod logging;
 pub mod mailbox;

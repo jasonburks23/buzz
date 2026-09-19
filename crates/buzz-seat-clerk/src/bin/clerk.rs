@@ -21,6 +21,7 @@ use buzz_seat_clerk::{
     config::ClerkConfig,
     connection::connect_with_backoff,
     discovery::{discover_channels, fetch_own_read_state, ChannelInfo, ChannelType},
+    heartbeat::write_heartbeat,
     lane::{classify, Lane},
     logging::{
         append_log_line, clerk_log_path, format_startup_banner, resolve_git_commit,
@@ -241,6 +242,16 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => warn!("read-state build failed: {e}"),
                 }
+            }
+
+            // opeff#1196: liveness heartbeat, written on every tick whether or
+            // not any mail arrived. Plain file write, no WakeEmitter reference
+            // anywhere in this call -- it cannot reach emit() and so cannot
+            // regress US-21 (mod timer_guard below). Best-effort: a failed
+            // write is logged and the tick continues, matching the read-state
+            // flush's own failure handling above.
+            if let Err(e) = write_heartbeat(&cfg.heartbeat_file, cfg.seat_role.as_deref(), now) {
+                warn!("heartbeat write failed: {e}");
             }
 
             // Poll the read-ack file for honest read-receipt advancement.
@@ -1319,6 +1330,57 @@ mod tests {
             // we are NOT calling it — but the structural change would be
             // visible in the Backoff type definition in connection.rs.
             // The timer-negative (US21-T2) would catch actual wake emission.
+        }
+
+        // -----------------------------------------------------------------
+        // Test US21-T5 — opeff#1196 HEARTBEAT NEGATIVE
+        //
+        // The heartbeat write added for CLERKALIVE01 (`heartbeat::write_heartbeat`,
+        // wired into the tick right before the read-ack poll in clerk.rs main())
+        // runs on every tick whether or not mail arrived. This is exactly the
+        // shape US-21 exists to guard: something that fires on a schedule.
+        // Prove it independently, riding this same harness: N heartbeat writes
+        // must leave the WAKE file untouched, because `write_heartbeat` takes a
+        // bare path string and never touches a `WakeEmitter`.
+        // -----------------------------------------------------------------
+        #[test]
+        fn us21_t5_heartbeat_writes_never_cause_a_wake() {
+            use buzz_seat_clerk::heartbeat::write_heartbeat;
+
+            let dir = tempdir().unwrap();
+            let wake_path = dir.path().join("wake");
+            let heartbeat_path = dir.path().join("heartbeat");
+            // Constructed only to document that the wake file below is the
+            // SAME kind of file a real WakeEmitter would write to; never
+            // called, since write_heartbeat has no reference to it at all.
+            let _emitter = WakeEmitter::new(wake_path.to_str().unwrap().to_string());
+
+            // 10 ticks' worth of heartbeat writes, the same count US21-T2 uses
+            // to model repeated timer fires.
+            for tick in 0..10u64 {
+                write_heartbeat(
+                    heartbeat_path.to_str().unwrap(),
+                    Some("Ops"),
+                    1_700_000_000 + tick,
+                )
+                .expect("write_heartbeat must not error");
+            }
+
+            // Positive control: the heartbeat file itself DID get written,
+            // otherwise the negative below would be vacuous.
+            assert!(
+                heartbeat_path.exists(),
+                "US21-T5 fixture broken: heartbeat file was never written"
+            );
+
+            // THE CORE ASSERTION: the wake file, a completely separate
+            // WakeEmitter instance the heartbeat code never references, must
+            // not exist after 10 heartbeat ticks.
+            assert!(
+                !wake_path.exists(),
+                "US21-T5 FAILED: a heartbeat write caused a seat-turn wake — \
+                 the heartbeat path must never reach WakeEmitter::emit"
+            );
         }
     } // mod timer_guard
 }
