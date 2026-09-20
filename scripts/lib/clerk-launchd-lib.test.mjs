@@ -252,3 +252,43 @@ print('OK')
     `special characters must round-trip through the real XML escaper: ${parseCheck.stderr}`,
   );
 });
+
+
+// ── pid file, opeff#1210 ─────────────────────────────────────────────────────────────────────
+// CLERKALIVE01, CLERKBIN01 and CLERKSTRAY01 read run/clerk-<alias>.pid. A launchd clerk that
+// writes none reads as dead and as a stray at once. The wrapper writes its own pid before exec,
+// under $HOME, never under Documents.
+
+test("CL-W5 (MUTATION TARGET): the rendered wrapper writes clerk-<alias>.pid into the run dir before exec, never under Documents", () => {
+  const script = bash(
+    'render_clerk_wrapper_script "/bin/clerk" "ops" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp" "/tmp/keys" "/tmp/runs"',
+  ).stdout;
+  assert.match(script, /PID_DIR="\/tmp\/runs"/, "must take the run dir from the twelfth argument");
+  assert.match(script, /echo "\$\$" > "\$PID_DIR\/clerk-ops\.pid"/, "MUTATION TARGET: must write its own pid to clerk-<alias>.pid");
+  const writeAt = script.indexOf('clerk-ops.pid');
+  const execAt = script.indexOf('exec "/bin/clerk"');
+  assert.ok(writeAt > 0 && execAt > writeAt, "the pid write must come before the exec");
+  const defaultScript = bash(
+    'render_clerk_wrapper_script "/bin/clerk" "ops" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp"',
+  ).stdout;
+  assert.match(defaultScript, /PID_DIR="\$HOME\/\.local\/agencyos\/run"/, "default run dir is under $HOME");
+  assert.doesNotMatch(defaultScript, /Documents/, "no Documents path anywhere in the wrapper");
+});
+
+test("CL-W5b: executed under a scratch HOME with a fixture clerk, the wrapper leaves clerk-<alias>.pid holding the pid the clerk ran as", () => {
+  const dir = "/tmp/clerk-lib-test-pid";
+  spawnSync("rm", ["-rf", dir]);
+  spawnSync("mkdir", ["-p", `${dir}/keys`, `${dir}/bin`]);
+  spawnSync("bash", ["-c", `printf 'K=x\\n' > ${dir}/keys/ghost.env && chmod 600 ${dir}/keys/ghost.env`]);
+  // The fixture clerk records the pid it runs as, so the test can compare it to the pid file.
+  spawnSync("bash", ["-c", `printf '#!/bin/sh\\necho $$ > ${dir}/ran-as.txt\\n' > ${dir}/bin/clerk && chmod +x ${dir}/bin/clerk`]);
+  const script = bash(
+    `render_clerk_wrapper_script "${dir}/bin/clerk" "ghost" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp" "${dir}/keys" "${dir}/run"`,
+  ).stdout;
+  const run = spawnSync("bash", ["-c", script], { encoding: "utf8", timeout: HARD_TIMEOUT_MS });
+  assert.equal(run.status, 0, `wrapper must exit 0 with a good header, got:\n${run.stderr}`);
+  const pidFile = spawnSync("cat", [`${dir}/run/clerk-ghost.pid`], { encoding: "utf8" }).stdout.trim();
+  const ranAs = spawnSync("cat", [`${dir}/ran-as.txt`], { encoding: "utf8" }).stdout.trim();
+  assert.match(pidFile, /^\d+$/, "pid file must hold one number");
+  assert.equal(pidFile, ranAs, "the pid file must name the pid the clerk itself ran as, since exec keeps the pid");
+});
