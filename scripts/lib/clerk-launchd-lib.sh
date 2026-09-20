@@ -25,6 +25,21 @@ clerk_wrapper_filename(){
   printf 'run-clerk-%s.sh' "$1"
 }
 
+# Reverse of clerk_plist_filename (opeff#1210): recover a seat alias from a generated plist's
+# filename, so the loader can enumerate DEPLOY_DIR directly instead of re-reading the registry.
+clerk_alias_from_plist_filename(){
+  local base="${1%.plist}"
+  printf '%s' "${base#com.civilization.buzz-seat-clerk-}"
+}
+
+# opeff#1210: path to the bare background clerk's literal pid file, written by
+# agencyos-comms-orchestrator's infra/clerks/tab-clerk-<alias>.sh (`echo $$ > .../run/clerk-<alias>.pid`).
+# Named here, once, so the loader and any future caller derive the same path instead of each
+# re-typing the "clerk-%s.pid" pattern.
+clerk_run_pid_path(){
+  printf '%s/clerk-%s.pid' "$1" "$2"
+}
+
 # launchd's own stdout/stderr redirect for the process, distinct from (and complementary to) the
 # clerk's own internal durable log (comms-orch#11 slice B's clerk_log_path): the internal log
 # captures structured app-level lines the binary itself writes; this captures anything printed

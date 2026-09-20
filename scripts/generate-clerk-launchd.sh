@@ -12,6 +12,9 @@
 # script's job ends at "here are the artifacts," and it prints the exact operator commands to take
 # it from there.
 #
+# opeff#1210: scripts/load-clerk-launchd.sh takes it from there -- it stops a seat's bare
+# background clerk pid by literal number, then copies and bootstraps this script's output.
+#
 # Usage: scripts/generate-clerk-launchd.sh [deploy_dir]
 #   deploy_dir defaults to $CLERK_LAUNCHD_DEPLOY_DIR or ~/.local/agencyos/launchd
 #   SEAT_REGISTRY_PATH overrides the registry location (same env var relaunch.sh reads).

@@ -48,6 +48,27 @@ test("CL-N2: clerk_plist_filename and clerk_wrapper_filename are discoverable, d
   );
 });
 
+test("CL-N4 (MUTATION TARGET): clerk_alias_from_plist_filename reverses clerk_plist_filename for any alias", () => {
+  for (const alias of ["holdout", "am", "creativedire"]) {
+    const filename = bash(`clerk_plist_filename "${alias}"`).stdout.trim();
+    const roundTrip = bash(
+      `clerk_alias_from_plist_filename "${filename}"`,
+    ).stdout.trim();
+    assert.equal(
+      roundTrip,
+      alias,
+      `MUTATION TARGET: round-tripping ${filename} must recover "${alias}"`,
+    );
+  }
+});
+
+test("CL-N5: clerk_run_pid_path is a deterministic function of run_dir and alias", () => {
+  assert.equal(
+    bash('clerk_run_pid_path "/tmp/run" "holdout"').stdout.trim(),
+    "/tmp/run/clerk-holdout.pid",
+  );
+});
+
 test("CL-N3 (MUTATION TARGET): clerk_launchd_stdout_path and clerk_launchd_stderr_path are distinct paths, both keyed by alias", () => {
   const out = bash('clerk_launchd_stdout_path "/tmp" "ops"').stdout.trim();
   const err = bash('clerk_launchd_stderr_path "/tmp" "ops"').stdout.trim();
