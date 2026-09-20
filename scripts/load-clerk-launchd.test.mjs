@@ -78,7 +78,10 @@ function makeFixture() {
   const callLog = join(stubDir, "calls.log");
   writeFileSync(
     join(stubDir, "launchctl"),
-    `#!/bin/sh\necho "$@" >> "${callLog}"\nif [ "$1" = "list" ]; then echo "1234\t0\t$2"; fi\n`,
+    // opeff#1210 gate-1 advisory: a real launchctl bootstrap refuses a plist path that
+    // does not exist, so the stub refuses too; a loader that bootstraps before it copies
+    // now reds instead of passing on a stub that accepted anything.
+    `#!/bin/sh\necho "$@" >> "${callLog}"\nif [ "$1" = "list" ]; then echo "1234\t0\t$2"; fi\nif [ "$1" = "bootstrap" ] && [ ! -f "$3" ]; then echo "stub: bootstrap on missing plist $3" >&2; exit 5; fi\n`,
   );
   chmodSync(join(stubDir, "launchctl"), 0o755);
 
