@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  copyFileSync,
   mkdtempSync,
   writeFileSync,
   mkdirSync,
@@ -146,9 +147,18 @@ test("LCL-3 (MUTATION TARGET): --live stops the bare pid by literal number befor
   // inside the same `bash -c` as the loader call keeps both in one tree, exactly like the real
   // tab-clerk-<alias>.sh background job and the loader running on the same host.
   const pidFile = join(f.runDir, "clerk-seatone.pid");
+  // opeff#1210 gate-2: the loader signals only a process whose command is the clerk binary, so
+  // the bare clerk here is a fake `clerk` under a scratch CLERK_INSTALL_DIR that just sleeps.
+  const fakeBinDir = join(f.dir, "bin");
+  mkdirSync(fakeBinDir, { recursive: true });
+  // A real executable named clerk, so `ps -o comm=` reports the clerk path the loader checks;
+  // a shell script that exec'd sleep would report sleep and be refused, correctly.
+  const fakeClerk = join(fakeBinDir, "clerk");
+  copyFileSync("/bin/sleep", fakeClerk);
+  chmodSync(fakeClerk, 0o755);
   const script = [
     "set -e",
-    "sleep 1000 &",
+    `${JSON.stringify(fakeClerk)} 1000 &`,
     "barepid=$!",
     `echo "$barepid" > ${JSON.stringify(pidFile)}`,
     `bash ${JSON.stringify(SCRIPT)} --live seatone`,
@@ -165,6 +175,7 @@ test("LCL-3 (MUTATION TARGET): --live stops the bare pid by literal number befor
       HOME: f.scratchHome,
       CLERK_LAUNCHD_DEPLOY_DIR: f.deployDir,
       CLERK_RUN_DIR: f.runDir,
+      CLERK_INSTALL_DIR: fakeBinDir,
       LAUNCHCTL_BIN: join(f.stubDir, "launchctl"),
     },
   });
@@ -270,4 +281,56 @@ test("PLISTKEY01 (MUTATION TARGET): the loaded plist under scratch HOME carries 
       `MUTATION TARGET: ${file} must never carry a *_NSEC key with an inline value`,
     );
   }
+});
+
+
+test("LCL-8 (MUTATION TARGET, opeff#1210 gate-2): a pid file naming a process that is not the clerk binary is refused and that process survives", () => {
+  const f = makeFixture();
+  const pidFile = join(f.runDir, "clerk-seatone.pid");
+  const script = [
+    "sleep 1000 &",
+    "barepid=$!",
+    `echo "$barepid" > ${JSON.stringify(pidFile)}`,
+    `bash ${JSON.stringify(SCRIPT)} --live seatone`,
+    "status=$?",
+    'if kill -0 "$barepid" 2>/dev/null; then echo BYSTANDER_ALIVE; kill -KILL "$barepid" 2>/dev/null || true; else echo BYSTANDER_DEAD; fi',
+    "exit $status",
+  ].join("\n");
+  const r = spawnSync("bash", ["-c", script], {
+    encoding: "utf8",
+    timeout: HARD_TIMEOUT_MS,
+    env: {
+      ...process.env,
+      HOME: f.scratchHome,
+      CLERK_LAUNCHD_DEPLOY_DIR: f.deployDir,
+      CLERK_RUN_DIR: f.runDir,
+      CLERK_INSTALL_DIR: join(f.dir, "no-such-bin"),
+      LAUNCHCTL_BIN: join(f.stubDir, "launchctl"),
+    },
+  });
+  assert.notEqual(r.status, 0, `the loader must refuse, got exit 0:\n${r.stdout}`);
+  assert.match(r.stderr, /REFUSING to signal pid \d+/, `expected a named refusal, got:\n${r.stderr}`);
+  assert.match(r.stdout, /BYSTANDER_ALIVE/, `MUTATION TARGET: the non-clerk process must survive, got:\n${r.stdout}`);
+  const calls = existsSync(f.callLog) ? readFileSync(f.callLog, "utf8") : "";
+  assert.doesNotMatch(calls, /bootstrap/, `no bootstrap may follow a refusal, got:\n${calls}`);
+});
+
+test("LCL-9: a stale pid file with no process is cleared and logged, never signalled", () => {
+  const f = makeFixture();
+  const pidFile = join(f.runDir, "clerk-seatone.pid");
+  writeFileSync(pidFile, "999999\n");
+  const r = spawnSync("bash", [SCRIPT, "--live", "seatone"], {
+    encoding: "utf8",
+    timeout: HARD_TIMEOUT_MS,
+    env: {
+      ...process.env,
+      HOME: f.scratchHome,
+      CLERK_LAUNCHD_DEPLOY_DIR: f.deployDir,
+      CLERK_RUN_DIR: f.runDir,
+      LAUNCHCTL_BIN: join(f.stubDir, "launchctl"),
+    },
+  });
+  assert.equal(r.status, 0, `expected success, got:\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /stale pid file, pid 999999 .* clearing it, never signalling/, r.stdout);
+  assert.equal(readFileSync(pidFile, "utf8"), "", "the stale pid file is emptied");
 });

@@ -35,6 +35,11 @@ RUN_DIR="${CLERK_RUN_DIR:-/Users/jasonburks/Documents/_AI_/Civilization-Skill-Su
 LAUNCHCTL_BIN="${LAUNCHCTL_BIN:-launchctl}"
 GUI_DOMAIN="gui/$(id -u)"
 STOP_WAIT_SECONDS=5
+# opeff#1210 gate-2: a pid on file is a number, not an identity. Before any signal the process
+# holding it must be a clerk, judged by its command path, the same way CLERKSTRAY01 judges one.
+# CLERK_INSTALL_DIR is the same override generate-clerk-launchd.sh honors.
+CLERK_INSTALL_DIR="${CLERK_INSTALL_DIR:-$HOME/.local/agencyos/bin}"
+CLERK_BIN_PATH="$CLERK_INSTALL_DIR/clerk"
 
 LIVE=0
 TARGET=""
@@ -131,10 +136,20 @@ stop_bare_clerk(){ # $1=alias
   fi
   pid="$(cat "$pid_path")"
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "$alias: no bare clerk running (pid $pid in $pid_path is already dead)"
+    echo "$alias: stale pid file, pid $pid in $pid_path has no process; clearing it, never signalling"
+    : > "$pid_path"
     return
   fi
-  echo "$alias: stopping bare clerk pid $pid"
+  # Identity before signal: the command path must be the clerk binary. A pid number can be
+  # reused by any process after the clerk that wrote the file exits; a stale file naming an
+  # operator process is a refusal, not a target.
+  local comm
+  comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+  if [ "$comm" != "$CLERK_BIN_PATH" ] && [ "$(basename "$comm")" != "clerk" ]; then
+    echo "$alias: REFUSING to signal pid $pid: its command is '$comm', not the clerk binary; fix or empty $pid_path by hand" >&2
+    return 3
+  fi
+  echo "$alias: stopping bare clerk pid $pid ($comm)"
   kill -TERM "$pid"
   waited=0
   while kill -0 "$pid" 2>/dev/null; do
