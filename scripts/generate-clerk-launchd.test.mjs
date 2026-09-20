@@ -231,6 +231,25 @@ test("GCL-3: the generated wrapper never contains the real secret value, only th
   );
 });
 
+test("GCL-3b (MUTATION TARGET): opeff#1227 -- the generated wrapper sources the per-seat keys dir, never ENVLOCAL, and never mentions Documents", () => {
+  const f = makeFixture();
+  run(f);
+  const wrapper = readFileSync(
+    join(f.deployDir, "run-clerk-overwatch.sh"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    wrapper,
+    /Documents/,
+    `MUTATION TARGET: a launchd-started process is refused under Documents on this host; no generated wrapper may reference that path, got:\n${wrapper}`,
+  );
+  assert.match(
+    wrapper,
+    /KEY_FILE="\$\{?CLERK_KEYS_DIR\}?[^"]*\/overwatch\.env"|KEY_FILE="\/[^"]*\/overwatch\.env"/,
+    `must source a per-seat header file under the keys dir, got:\n${wrapper}`,
+  );
+});
+
 test("GCL-4 (MUTATION TARGET): refuses to generate anything when the canonical clerk binary is missing", () => {
   const f = makeFixture({ withClerkBin: false });
   const r = run(f);
