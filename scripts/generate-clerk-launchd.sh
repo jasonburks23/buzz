@@ -36,6 +36,8 @@ REG="${SEAT_REGISTRY_PATH:-/Users/jasonburks/Documents/_AI_/Civilization-Skill-S
 CLERK_INSTALL_DIR="${CLERK_INSTALL_DIR:-$HOME/.local/agencyos/bin}"
 CLERK_BIN="$CLERK_INSTALL_DIR/clerk"
 CLERK_LOG_DIR="${CLERK_LOG_DIR:-/tmp}"
+# opeff#1227: the wrapper sources its key from here, never from ENVLOCAL under Documents.
+CLERK_KEYS_DIR="${CLERK_KEYS_DIR:-$HOME/.local/agencyos/keys}"
 
 if [ ! -f "$REG" ]; then
   echo "generate-clerk-launchd: no registry at $REG (set SEAT_REGISTRY_PATH)" >&2
@@ -145,8 +147,8 @@ while IFS=$'\t' read -r alias status keyvar_name; do
       stdout_path=$(clerk_launchd_stdout_path "$CLERK_LOG_DIR" "$alias")
       stderr_path=$(clerk_launchd_stderr_path "$CLERK_LOG_DIR" "$alias")
 
-      render_clerk_wrapper_script "$CLERK_BIN" "$ENVLOCAL" "$KEYVAR" "$WSRELAY" "$ROLE" \
-        "$SESSION" "$WAKE" "$READACK" "/tmp" "$CLERK_LOG_DIR" > "$wrapper_path"
+      render_clerk_wrapper_script "$CLERK_BIN" "$alias" "$KEYVAR" "$WSRELAY" "$ROLE" \
+        "$SESSION" "$WAKE" "$READACK" "/tmp" "$CLERK_LOG_DIR" "$CLERK_KEYS_DIR" > "$wrapper_path"
       chmod +x "$wrapper_path"
 
       render_clerk_plist "$label" "$wrapper_path" "$stdout_path" "$stderr_path" > "$plist_path"

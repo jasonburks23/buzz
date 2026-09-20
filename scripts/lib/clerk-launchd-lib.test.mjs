@@ -85,7 +85,7 @@ test("CL-N3 (MUTATION TARGET): clerk_launchd_stdout_path and clerk_launchd_stder
 
 test("CL-W1 (MUTATION TARGET): render_clerk_wrapper_script embeds the KEYVAR NAME, never a literal secret value", () => {
   const script = bash(
-    'render_clerk_wrapper_script "/bin/clerk" "/tmp/env.local" "OVERWATCH_NSEC" "wss://relay" "AgencyOS-Overwatch" "sess-1" "/tmp/wake.json" "/tmp/readack.json" "/tmp" "/tmp"',
+    'render_clerk_wrapper_script "/bin/clerk" "overwatch" "OVERWATCH_NSEC" "wss://relay" "AgencyOS-Overwatch" "sess-1" "/tmp/wake.json" "/tmp/readack.json" "/tmp" "/tmp" "/tmp/keys"',
   ).stdout;
   assert.match(
     script,
@@ -94,8 +94,13 @@ test("CL-W1 (MUTATION TARGET): render_clerk_wrapper_script embeds the KEYVAR NAM
   );
   assert.match(
     script,
-    /\. "\/tmp\/env\.local"/,
-    "must source ENVLOCAL before exporting SEAT_NSEC",
+    /\. "\$KEY_FILE"/,
+    "must source the per-seat header file (via $KEY_FILE) before exporting SEAT_NSEC",
+  );
+  assert.match(
+    script,
+    /KEY_FILE="\/tmp\/keys\/overwatch\.env"/,
+    "must point KEY_FILE at keys_dir\\/<alias>.env",
   );
   assert.match(
     script,
@@ -104,9 +109,59 @@ test("CL-W1 (MUTATION TARGET): render_clerk_wrapper_script embeds the KEYVAR NAM
   );
 });
 
+test("CL-W1b (MUTATION TARGET): the wrapper never sources anything under Documents", () => {
+  const script = bash(
+    'render_clerk_wrapper_script "/bin/clerk" "overwatch" "OVERWATCH_NSEC" "wss://relay" "AgencyOS-Overwatch" "sess-1" "/tmp/wake.json" "/tmp/readack.json" "/tmp" "/tmp"',
+  ).stdout;
+  assert.doesNotMatch(
+    script,
+    /Documents/,
+    "MUTATION TARGET: opeff#1227 -- a launchd-started process is refused under Documents on this host; the wrapper must never reference that path",
+  );
+});
+
+test("CL-W1c (MUTATION TARGET): the wrapper refuses loud, naming place-clerk-keys.sh, when the header file is missing", () => {
+  const dir = "/tmp/clerk-lib-test-missing";
+  spawnSync("rm", ["-rf", dir]);
+  const script = bash(
+    `render_clerk_wrapper_script "/bin/clerk" "ghost" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp" "${dir}"`,
+  ).stdout;
+  const run = spawnSync("bash", ["-c", script], {
+    encoding: "utf8",
+    timeout: HARD_TIMEOUT_MS,
+  });
+  assert.notEqual(run.status, 0, "must exit non-zero when the header file is missing");
+  assert.match(
+    run.stderr,
+    /place-clerk-keys\.sh/,
+    `must name the placement script in the refusal, got:\n${run.stderr}`,
+  );
+});
+
+test("CL-W1d (MUTATION TARGET): the wrapper refuses loud, naming place-clerk-keys.sh, when the header file is not mode 600", () => {
+  const dir = "/tmp/clerk-lib-test-badmode";
+  spawnSync("rm", ["-rf", dir]);
+  spawnSync("mkdir", ["-p", dir]);
+  spawnSync("bash", ["-c", `printf 'K=x\\n' > ${dir}/ghost.env`]);
+  spawnSync("chmod", ["644", `${dir}/ghost.env`]);
+  const script = bash(
+    `render_clerk_wrapper_script "/bin/clerk" "ghost" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp" "${dir}"`,
+  ).stdout;
+  const run = spawnSync("bash", ["-c", script], {
+    encoding: "utf8",
+    timeout: HARD_TIMEOUT_MS,
+  });
+  assert.notEqual(run.status, 0, "must exit non-zero when the header file is mode 644");
+  assert.match(
+    run.stderr,
+    /place-clerk-keys\.sh/,
+    `must name the placement script in the refusal, got:\n${run.stderr}`,
+  );
+});
+
 test("CL-W2: render_clerk_wrapper_script sets every env var the clerk binary reads", () => {
   const script = bash(
-    'render_clerk_wrapper_script "/bin/clerk" "/tmp/env.local" "K" "wss://relay" "AgencyOS-Ops" "sess-2" "/tmp/wake.json" "/tmp/readack.json" "/tmp/claims" "/tmp/logs"',
+    'render_clerk_wrapper_script "/bin/clerk" "ops" "K" "wss://relay" "AgencyOS-Ops" "sess-2" "/tmp/wake.json" "/tmp/readack.json" "/tmp/claims" "/tmp/logs"',
   ).stdout;
   for (const [key, value] of [
     ["RELAY_URL", "wss://relay"],
@@ -127,7 +182,7 @@ test("CL-W2: render_clerk_wrapper_script sets every env var the clerk binary rea
 
 test("CL-W3: the wrapper is a valid bash script (set -euo pipefail, no syntax errors)", () => {
   const script = bash(
-    'render_clerk_wrapper_script "/bin/clerk" "/tmp/env.local" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp"',
+    'render_clerk_wrapper_script "/bin/clerk" "seat" "K" "wss://relay" "role" "sess" "/tmp/w" "/tmp/r" "/tmp" "/tmp"',
   ).stdout;
   const check = spawnSync("bash", ["-n", "/dev/stdin"], {
     input: script,
