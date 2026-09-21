@@ -28,12 +28,12 @@ clerk_wrapper_filename(){
 # opeff#1232: Login Items names a job by the first binary launchd starts. A plist that starts
 # run-clerk-<alias>.sh shows as that script from an unidentified developer. Every other AgencyOS
 # job starts a small named launcher under ~/Library/Application Support/AgencyOS instead, so the
-# list reads AgencyOS-<Thing>. The clerk gets the same: AgencyOS-Clerk-<Role>, role with spaces
+# list reads AgencyOS-<Thing>. The clerk gets the same: AgencyOS-Clerk-<Role>, role with spaces and hyphens
 # removed, compiled from a generated C source, which execs the wrapper through bash.
 #   $1 role, e.g. "Art Director" -> AgencyOS-Clerk-ArtDirector
 clerk_launcher_name(){
   local r
-  r="$(printf '%s' "$1" | sed 's/^AgencyOS-//' | tr -d ' ')"
+  r="$(printf '%s' "$1" | sed 's/^AgencyOS-//' | tr -d ' -')"
   printf 'AgencyOS-Clerk-%s' "$r"
 }
 

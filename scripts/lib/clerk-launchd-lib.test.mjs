@@ -294,8 +294,8 @@ test("CL-W5b: executed under a scratch HOME with a fixture clerk, the wrapper le
 });
 
 // ── named launcher, opeff#1232 ───────────────────────────────────────────────────────────────
-test("CL-L1: clerk_launcher_name drops spaces and a leading AgencyOS- so Login Items reads AgencyOS-Clerk-<Role>", () => {
-  for (const [role, want] of [["Art Director", "AgencyOS-Clerk-ArtDirector"], ["Ops", "AgencyOS-Clerk-Ops"], ["AgencyOS-Overwatch", "AgencyOS-Clerk-Overwatch"], ["Sub-TP", "AgencyOS-Clerk-Sub-TP"]]) {
+test("CL-L1: clerk_launcher_name drops spaces, hyphens and a leading AgencyOS- so Login Items reads AgencyOS-Clerk-<Role>", () => {
+  for (const [role, want] of [["Art Director", "AgencyOS-Clerk-ArtDirector"], ["Ops", "AgencyOS-Clerk-Ops"], ["AgencyOS-Overwatch", "AgencyOS-Clerk-Overwatch"], ["Sub-TP", "AgencyOS-Clerk-SubTP"], ["MP-TP", "AgencyOS-Clerk-MPTP"]]) {
     assert.equal(bash(`clerk_launcher_name "${role}"`).stdout.trim(), want);
   }
 });

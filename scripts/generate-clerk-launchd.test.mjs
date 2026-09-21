@@ -300,7 +300,7 @@ test("GCL-5: never invokes launchctl as a live command -- only ever prints it as
 
 // opeff#1232: Login Items names a job by the first binary launchd starts. The plist starts a
 // compiled launcher named AgencyOS-Clerk-<Role>, which execs the wrapper through bash.
-test("GCL-6 (MUTATION TARGET): the generator compiles AgencyOS-Clerk-<Role> into the launcher dir and it execs the wrapper", () => {
+test("GCL-9 (MUTATION TARGET): the generator compiles AgencyOS-Clerk-<Role> into the launcher dir and it execs the wrapper", () => {
   const f = makeFixture();
   run(f);
   const launcher = join(f.dir, "launchers", "AgencyOS-Clerk-Overwatch");
