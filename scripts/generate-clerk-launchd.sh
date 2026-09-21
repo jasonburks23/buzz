@@ -41,6 +41,8 @@ CLERK_KEYS_DIR="${CLERK_KEYS_DIR:-$HOME/.local/agencyos/keys}"
 # opeff#1210: where each wrapper writes its clerk pid file, clerk-<alias>.pid. Under $HOME, never
 # under Documents. The health checks and load-clerk-launchd.sh read this same directory.
 CLERK_PID_DIR="${CLERK_PID_DIR:-$HOME/.local/agencyos/run}"
+# opeff#1232: where the named launcher binaries land, the dir Login Items reads names from.
+CLERK_LAUNCHER_DIR="${CLERK_LAUNCHER_DIR:-$HOME/Library/Application Support/AgencyOS}"
 
 if [ ! -f "$REG" ]; then
   echo "generate-clerk-launchd: no registry at $REG (set SEAT_REGISTRY_PATH)" >&2
@@ -154,9 +156,16 @@ while IFS=$'\t' read -r alias status keyvar_name; do
         "$SESSION" "$WAKE" "$READACK" "/tmp" "$CLERK_LOG_DIR" "$CLERK_KEYS_DIR" "$CLERK_PID_DIR" > "$wrapper_path"
       chmod +x "$wrapper_path"
 
-      render_clerk_plist "$label" "$wrapper_path" "$stdout_path" "$stderr_path" > "$plist_path"
+      launcher_name=$(clerk_launcher_name "$ROLE")
+      launcher_src="$DEPLOY_DIR/$launcher_name.c"
+      launcher_path="$CLERK_LAUNCHER_DIR/$launcher_name"
+      mkdir -p "$CLERK_LAUNCHER_DIR"
+      render_clerk_launcher_source "$launcher_name" "$wrapper_path" > "$launcher_src"
+      compile_clerk_launcher "$launcher_src" "$launcher_path"
 
-      echo "generate-clerk-launchd: wrote $plist_path (wrapper: $wrapper_path)"
+      render_clerk_plist "$label" "$launcher_path" "$stdout_path" "$stderr_path" > "$plist_path"
+
+      echo "generate-clerk-launchd: wrote $plist_path, launcher $launcher_path, wrapper $wrapper_path"
       GENERATED+=("$plist_path")
       ;;
     NO_CHANNELS)

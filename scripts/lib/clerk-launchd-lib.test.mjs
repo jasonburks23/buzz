@@ -292,3 +292,17 @@ test("CL-W5b: executed under a scratch HOME with a fixture clerk, the wrapper le
   assert.match(pidFile, /^\d+$/, "pid file must hold one number");
   assert.equal(pidFile, ranAs, "the pid file must name the pid the clerk itself ran as, since exec keeps the pid");
 });
+
+// ── named launcher, opeff#1232 ───────────────────────────────────────────────────────────────
+test("CL-L1: clerk_launcher_name drops spaces and a leading AgencyOS- so Login Items reads AgencyOS-Clerk-<Role>", () => {
+  for (const [role, want] of [["Art Director", "AgencyOS-Clerk-ArtDirector"], ["Ops", "AgencyOS-Clerk-Ops"], ["AgencyOS-Overwatch", "AgencyOS-Clerk-Overwatch"], ["Sub-TP", "AgencyOS-Clerk-Sub-TP"]]) {
+    assert.equal(bash(`clerk_launcher_name "${role}"`).stdout.trim(), want);
+  }
+});
+
+test("CL-L2 (MUTATION TARGET): render_clerk_launcher_source execs the wrapper through bash and names the launcher in its header", () => {
+  const src = bash('render_clerk_launcher_source "AgencyOS-Clerk-Ops" "/tmp/x/run-clerk-ops.sh"').stdout;
+  assert.match(src, /execl\("\/bin\/bash", "\/bin\/bash", "\/tmp\/x\/run-clerk-ops\.sh", \(char \*\)0\)/);
+  assert.match(src, /AgencyOS-Clerk-Ops/);
+  assert.match(src, /GENERATED/);
+});

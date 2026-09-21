@@ -99,6 +99,7 @@ function run(fixture) {
       CLERK_INSTALL_DIR: fixture.installDir,
       CLERK_LAUNCHD_DEPLOY_DIR: fixture.deployDir,
       CLERK_LOG_DIR: fixture.logDir,
+      CLERK_LAUNCHER_DIR: join(fixture.dir, "launchers"),
     },
   });
 }
@@ -189,7 +190,7 @@ test("GCL-8: a mixed roster (one bootable, one retired, one unprovisioned) gener
   assert.match(r.stdout, /1 skipped: no key/, r.stdout);
 });
 
-test("GCL-2: the generated plist points ProgramArguments at the wrapper, with RunAtLoad+KeepAlive true", () => {
+test("GCL-2: the generated plist points ProgramArguments at the named launcher, with RunAtLoad+KeepAlive true", () => {
   const f = makeFixture();
   run(f);
   const plistPath = join(
@@ -204,7 +205,7 @@ test("GCL-2: the generated plist points ProgramArguments at the wrapper, with Ru
 import plistlib, sys
 d = plistlib.load(open(sys.argv[1], 'rb'))
 assert d['Label'] == 'com.civilization.buzz-seat-clerk-overwatch', d
-assert d['ProgramArguments'][0].endswith('run-clerk-overwatch.sh'), d
+assert d['ProgramArguments'][0].endswith('/launchers/AgencyOS-Clerk-Overwatch'), d
 assert d['RunAtLoad'] is True, d
 assert d['KeepAlive'] is True, d
 print('OK')
@@ -295,4 +296,31 @@ test("GCL-5: never invokes launchctl as a live command -- only ever prints it as
     !existsSync(callLog),
     `MUTATION TARGET: launchctl must never actually be invoked by this generator -- that is operator hands. Calls seen: ${existsSync(callLog) ? readFileSync(callLog, "utf8") : ""}`,
   );
+});
+
+// opeff#1232: Login Items names a job by the first binary launchd starts. The plist starts a
+// compiled launcher named AgencyOS-Clerk-<Role>, which execs the wrapper through bash.
+test("GCL-6 (MUTATION TARGET): the generator compiles AgencyOS-Clerk-<Role> into the launcher dir and it execs the wrapper", () => {
+  const f = makeFixture();
+  run(f);
+  const launcher = join(f.dir, "launchers", "AgencyOS-Clerk-Overwatch");
+  assert.ok(existsSync(launcher), `expected a compiled launcher at ${launcher}`);
+  const st = spawnSync("test", ["-x", launcher]);
+  assert.equal(st.status, 0, "launcher must be executable");
+  const src = readFileSync(join(f.deployDir, "AgencyOS-Clerk-Overwatch.c"), "utf8");
+  assert.match(src, /execl\("\/bin\/bash", "\/bin\/bash", ".*run-clerk-overwatch\.sh", \(char \*\)0\)/, "MUTATION TARGET: launcher must exec the seat wrapper");
+  assert.doesNotMatch(src, /Documents/);
+  // Run the real binary with a stand-in wrapper path: swap the wrapper for a script that prints
+  // a marker, so the exec chain is proven, not just read.
+  const marker = join(f.dir, "marker.sh");
+  writeFileSync(marker, "#!/bin/bash\necho LAUNCHER-CHAIN-OK\n");
+  spawnSync("chmod", ["+x", marker]);
+  const srcB = src.replace(/run-clerk-overwatch\.sh"/, `MARKER"`).replace(/"[^"]*MARKER"/, `"${marker}"`);
+  const srcPath = join(f.dir, "chain.c");
+  writeFileSync(srcPath, srcB);
+  const bin = join(f.dir, "chain");
+  const cc = spawnSync("cc", ["-O2", "-o", bin, srcPath], { encoding: "utf8" });
+  assert.equal(cc.status, 0, cc.stderr);
+  const out = spawnSync(bin, [], { encoding: "utf8", timeout: HARD_TIMEOUT_MS });
+  assert.match(out.stdout, /LAUNCHER-CHAIN-OK/, "the compiled launcher must exec the wrapper through bash");
 });
