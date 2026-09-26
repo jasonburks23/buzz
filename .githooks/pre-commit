@@ -1,16 +1,18 @@
 #!/bin/sh
-# Fleet-generic pre-commit gate: voice (em/en dash) + secret hygiene. Issue #33.
-# Check only NEWLY ADDED lines so pre-existing content never blocks a commit.
-_added_md=$(git diff --cached --unified=0 --diff-filter=ACM -- '*.md' 2>/dev/null | grep -E '^\+' | grep -v '^+++' || true)
-if [ -n "$_added_md" ]; then
-  _hits=$(printf '%s\n' "$_added_md" | perl -CS -ne 'print if /[\x{2013}\x{2014}]/')
-  if [ -n "$_hits" ]; then
-    echo "pre-commit BLOCK (fleet voice): em/en dash in newly added markdown. Use hyphen, period, comma, colon, semicolon."
-    printf '%s\n' "$_hits" | head -5
-    echo "Bypass only if certain: git commit --no-verify"
-    exit 1
-  fi
+# Fleet-generic pre-commit gate: voice through the one central core, plus secret hygiene. Issue #33.
+#
+# opeff#1359: the dash rule is no longer written inline here. This gate runs the central core from
+# the read-only mirror, fail closed, and every dash refusal carries [opeff#1347 voice-lint-core], so
+# changing the rule is one edit in opeff main. The core is bash and this hook is sh, so the core runs
+# in a bash child; it exits 1 to block, and that status carries back here. Nine repos carry this file
+# byte for byte, so a change here is made once and applied to all nine.
+_VOICE_LINT_CORE="$HOME/.local/agencyos/main/agencyos-operational-efficiency/hooks/voice-lint-core.sh"
+if [ ! -r "$_VOICE_LINT_CORE" ]; then
+  echo "pre-commit [opeff#1347 voice-lint-core]: the canonical core is missing or unreadable at $_VOICE_LINT_CORE. Refusing to pass a commit with the dash gate absent. The mirror is refreshed by launchd from opeff main; check it with refresh-main-mirror.sh --check." >&2
+  exit 1
 fi
+bash -c '. "$1"' voice-lint-core "$_VOICE_LINT_CORE" || exit 1
+
 _secrets=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null | grep -E '(^|/)(\.env|.*\.pem|.*_rsa|.*\.p12|id_ed25519)$' || true)
 if [ -n "$_secrets" ]; then
   echo "pre-commit BLOCK: possible secret file(s) staged:"
