@@ -111,12 +111,18 @@ impl DeliveredStore {
     }
 }
 
+/// The store lists event ids a bot was shown, so only its owner may read it:
+/// the file is 0600 and its folder 0700, set before the rename so the store
+/// is never visible with wider permissions.
 fn write_atomically(path: &Path, entries: &HashMap<String, u64>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(entries)?)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(&tmp, path)
 }
 
@@ -215,6 +221,18 @@ mod tests {
         assert_eq!(store.len(), 0, "a corrupt store must read as empty, never block the bot");
         store.record(["aa".to_string()], 1_000);
         assert!(DeliveredStore::load(path, 1_000).contains("aa"), "the next save repairs it");
+    }
+
+    #[test]
+    fn the_store_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_store("perms");
+        let mut store = DeliveredStore::load(path.clone(), 1_000);
+        store.record(["aa".to_string()], 1_000);
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "the store lists event ids, so it is 0600");
+        assert_eq!(dir_mode, 0o700, "and its folder is 0700");
     }
 
     #[test]
