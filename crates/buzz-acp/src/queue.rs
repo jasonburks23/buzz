@@ -1410,15 +1410,9 @@ fn format_context_hints(
 }
 
 /// Format a conversation context section (thread or DM).
-/// Label for a context event that an EARLIER session of this bot was already
-/// shown, buzz#29. The event is still rendered in full, since a fresh session
-/// needs it to understand the thread; the label stops it reading as new.
-pub(crate) const DELIVERED_EARLIER_LABEL: &str = "[delivered to an earlier session of this bot; it may already be handled, so check the ticket and branch before acting on it]";
-
 fn format_conversation_context(
     ctx: &ConversationContext,
     profile_lookup: Option<&PromptProfileLookup>,
-    delivered_earlier: Option<&HashSet<String>>,
 ) -> String {
     let (label, messages, total, truncated) = match ctx {
         ConversationContext::Thread {
@@ -1439,14 +1433,11 @@ fn format_conversation_context(
         messages.len()
     );
     for (i, msg) in messages.iter().enumerate() {
-        let earlier = !msg.event_id.is_empty()
-            && delivered_earlier.is_some_and(|ids| ids.contains(&msg.event_id));
         s.push_str(&format!(
-            "\n[{}] {} ({}){}: {}",
+            "\n[{}] {} ({}): {}",
             i + 1,
             format_prompt_actor(&msg.pubkey, profile_lookup),
             msg.timestamp,
-            if earlier { format!(" {DELIVERED_EARLIER_LABEL}") } else { String::new() },
             msg.content,
         ));
     }
@@ -1464,9 +1455,6 @@ pub struct FormatPromptArgs<'a> {
     /// True when delivery-delta filtering removed at least one event that this
     /// live session had already received. Trigger-only context does not set it.
     pub conversation_context_had_delivered_events: bool,
-    /// buzz#29: context event IDs an earlier session of this bot was shown.
-    /// Rendered in full, but labelled. `None` labels nothing.
-    pub delivered_earlier_event_ids: Option<&'a HashSet<String>>,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
@@ -1649,11 +1637,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 
     // 3. Conversation context (thread or DM).
     if let Some(ctx) = args.conversation_context {
-        sections.push(format_conversation_context(
-            ctx,
-            args.profile_lookup,
-            args.delivered_earlier_event_ids,
-        ));
+        sections.push(format_conversation_context(ctx, args.profile_lookup));
     }
 
     // 4. Cancelled + re-prompt framing. When a turn was cancelled to deliver
@@ -5406,30 +5390,5 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
-    }
-
-    // ---- buzz#29: an earlier-delivered context event renders in full, labelled --
-    #[test]
-    fn buzz29_formatter_labels_only_earlier_delivered_events() {
-        let msg = |id: &str, content: &str| ContextMessage {
-            event_id: id.to_string(),
-            pubkey: "author".into(),
-            timestamp: "2026-09-18T14:00:00Z".into(),
-            content: content.into(),
-        };
-        let ctx = ConversationContext::Thread {
-            messages: vec![msg("root", "dispatch: build the thing"), msg("new", "a new reply")],
-            total: 2,
-            truncated: false,
-        };
-        let earlier = HashSet::from(["root".to_string()]);
-        let out = format_conversation_context(&ctx, None, Some(&earlier));
-        let root_line = out.lines().find(|l| l.contains("dispatch: build the thing")).unwrap();
-        let new_line = out.lines().find(|l| l.contains("a new reply")).unwrap();
-        assert!(root_line.contains(DELIVERED_EARLIER_LABEL), "the old dispatch is labelled: {root_line}");
-        assert!(root_line.contains("dispatch: build the thing"), "and still rendered in full");
-        assert!(!new_line.contains(DELIVERED_EARLIER_LABEL), "a new reply is not: {new_line}");
-        let none = format_conversation_context(&ctx, None, None);
-        assert!(!none.contains(DELIVERED_EARLIER_LABEL), "no set, no labels");
     }
 }
