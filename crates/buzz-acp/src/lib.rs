@@ -2,6 +2,7 @@
 
 mod acp;
 mod config;
+mod delivered_store;
 mod engram_fetch;
 mod filter;
 mod observer;
@@ -2310,7 +2311,10 @@ async fn tokio_main() -> Result<()> {
                     let agent = OwnedAgent {
                         index: rr.index,
                         acp,
-                        state: SessionState::default(),
+                        state: SessionState {
+                            delivered_store: Some(delivered_store::for_bot(&pubkey_hex)),
+                            ..SessionState::default()
+                        },
                         model_capabilities: None,
                         desired_model: config.model.clone(),
                         model_overridden: false,
@@ -4423,6 +4427,9 @@ struct PoolStartup {
     has_generated_codex_config: bool,
     model: Option<String>,
     observer: Option<observer::ObserverHandle>,
+    /// buzz#29: the process-wide record of events this bot already showed a
+    /// session. Every agent in the pool shares it.
+    delivered_store: delivered_store::SharedDeliveredStore,
 }
 
 impl PoolStartup {
@@ -4435,6 +4442,7 @@ impl PoolStartup {
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
             observer,
+            delivered_store: delivered_store::for_bot(&config.keys.public_key().to_hex()),
         }
     }
 }
@@ -4497,7 +4505,10 @@ async fn initialize_agent_pool(
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
-                            state: SessionState::default(),
+                            state: SessionState {
+                                delivered_store: Some(startup.delivered_store.clone()),
+                                ..SessionState::default()
+                            },
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
                             model_overridden: false,

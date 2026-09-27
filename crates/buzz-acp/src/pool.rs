@@ -129,6 +129,10 @@ pub struct SessionState {
     /// Per-channel successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<Uuid, ChannelDeliveryState>,
+    /// buzz#29: the bot-wide record of events ANY session of this bot was
+    /// shown, persisted across restarts. Never cleared on invalidation; that
+    /// is the point. `None` in tests that do not exercise it.
+    pub delivered_store: Option<crate::delivered_store::SharedDeliveredStore>,
 }
 
 impl SessionState {
@@ -174,9 +178,16 @@ impl SessionState {
         standing_context_sent: bool,
         event_ids: impl IntoIterator<Item = String>,
     ) {
+        let event_ids: Vec<String> = event_ids.into_iter().collect();
         let delivery = self.deliveries.entry(channel_id).or_default();
         delivery.standing_context_sent |= standing_context_sent;
-        delivery.delivered_event_ids.extend(event_ids);
+        delivery.delivered_event_ids.extend(event_ids.iter().cloned());
+        if let Some(store) = &self.delivered_store {
+            match store.lock() {
+                Ok(mut store) => store.record(event_ids, crate::delivered_store::unix_now()),
+                Err(_) => tracing::warn!("delivered store lock poisoned, not recorded"),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2071,6 +2082,11 @@ pub async fn run_prompt_task(
             });
         let conversation_context =
             conversation_context_delta(conversation_context, &delivered_ids, &rendered_batch_ids);
+        // buzz#29: what survives the per-session delta is new to THIS session,
+        // but an earlier session of this bot may have been shown it. Those are
+        // rendered in full and labelled, never dropped.
+        let delivered_earlier_ids =
+            delivered_earlier_event_ids(agent.state.delivered_store.as_ref(), conversation_context.as_ref());
         pending_delivered_event_ids.extend(rendered_batch_ids);
         pending_delivered_event_ids.extend(conversation_context_event_ids(
             conversation_context.as_ref(),
@@ -2103,6 +2119,7 @@ pub async fn run_prompt_task(
                 channel_info: channel_info.as_ref(),
                 conversation_context: conversation_context.as_ref(),
                 conversation_context_had_delivered_events,
+                delivered_earlier_event_ids: Some(&delivered_earlier_ids),
                 profile_lookup: profile_lookup.as_ref(),
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: standing.base_prompt,
@@ -2947,6 +2964,21 @@ fn conversation_context_event_ids(context: Option<&ConversationContext>) -> Hash
             .collect(),
         None => HashSet::new(),
     }
+}
+
+/// buzz#29: the context event IDs that some earlier session of this bot was
+/// already shown, per the persisted store. A missing or poisoned store labels
+/// nothing, which is today's behavior.
+fn delivered_earlier_event_ids(
+    store: Option<&crate::delivered_store::SharedDeliveredStore>,
+    context: Option<&ConversationContext>,
+) -> HashSet<String> {
+    let Some(store) = store else { return HashSet::new() };
+    let Ok(store) = store.lock() else { return HashSet::new() };
+    conversation_context_event_ids(context)
+        .into_iter()
+        .filter(|id| store.contains(id))
+        .collect()
 }
 
 /// Remove events already delivered to this live ACP session. Triggering events
@@ -8137,5 +8169,85 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             "one fetch_channel_info sequence (initial attempt + single retry)"
         );
         server.abort();
+    }
+
+    // ---- buzz#29, opeff#1197: persist and label, never suppress ----------------
+    fn buzz29_store_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("buzz29-pool-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("delivered.json")
+    }
+
+    fn buzz29_state(path: &std::path::Path) -> SessionState {
+        let store = crate::delivered_store::DeliveredStore::load(path.to_path_buf(), 1_000);
+        SessionState {
+            delivered_store: Some(Arc::new(std::sync::Mutex::new(store))),
+            ..SessionState::default()
+        }
+    }
+
+    fn buzz29_thread() -> ConversationContext {
+        ConversationContext::Thread {
+            messages: vec![
+                context_message("root", "dispatch: build the thing"),
+                context_message("reply", "a new reply in the old thread"),
+            ],
+            total: 2,
+            truncated: false,
+        }
+    }
+
+    /// (MUTATION TARGET) Acceptance 1: after a restart, an old dispatch comes back
+    /// as thread context LABELLED. Dropping the load at start drops the label.
+    #[test]
+    fn buzz29_restart_labels_a_dispatch_an_earlier_session_saw() {
+        let channel = Uuid::new_v4();
+        let path = buzz29_store_path("restart");
+        let mut before = buzz29_state(&path);
+        before.mark_channel_delivery_success(channel, false, ["root".to_string()]);
+
+        // The restart: a new process, a new store handle loaded from disk, and a
+        // session that has delivered nothing yet.
+        let after = buzz29_state(&path);
+        let session_delivered = HashSet::new();
+        let triggering = HashSet::from(["reply".to_string()]);
+        let context = conversation_context_delta(Some(buzz29_thread()), &session_delivered, &triggering)
+            .expect("the root must still render, a fresh session needs it");
+        let earlier = delivered_earlier_event_ids(after.delivered_store.as_ref(), Some(&context));
+        assert_eq!(earlier, HashSet::from(["root".to_string()]));
+    }
+
+    /// Acceptance 2 and 3: a first-time event is never labelled.
+    #[test]
+    fn buzz29_a_first_time_event_is_unlabelled() {
+        let path = buzz29_store_path("fresh");
+        let state = buzz29_state(&path);
+        let context = ConversationContext::Thread {
+            messages: vec![context_message("never-seen", "brand new")],
+            total: 1,
+            truncated: false,
+        };
+        assert!(delivered_earlier_event_ids(state.delivered_store.as_ref(), Some(&context)).is_empty());
+    }
+
+    /// In-process rotation is covered too: invalidating the session clears the
+    /// per-session set, but the bot-wide store keeps the label.
+    #[test]
+    fn buzz29_session_rotation_keeps_the_label() {
+        let channel = Uuid::new_v4();
+        let path = buzz29_store_path("rotation");
+        let mut state = buzz29_state(&path);
+        state.mark_channel_delivery_success(channel, false, ["root".to_string()]);
+        state.invalidate_channel(&channel);
+        assert!(!state.deliveries.contains_key(&channel), "rotation still clears the session set");
+        let earlier = delivered_earlier_event_ids(state.delivered_store.as_ref(), Some(&buzz29_thread()));
+        assert!(earlier.contains("root"));
+        assert!(!earlier.contains("reply"));
+    }
+
+    /// No store, as in every existing test, labels nothing: today's behavior.
+    #[test]
+    fn buzz29_no_store_labels_nothing() {
+        assert!(delivered_earlier_event_ids(None, Some(&buzz29_thread())).is_empty());
     }
 }
